@@ -1950,6 +1950,11 @@ struct netmap_obj_pool;
 /* alignment for netmap buffers */
 #define NM_BUF_ALIGN	64
 
+/* Audio over Ether */
+#ifdef CONFIG_SMPD_OPTION_AOE
+#include "audio_over_ether.h"
+extern struct lut_entry ext_lut[AOE_NUM_SLOTS];
+#endif
 /*
  * NMB return the virtual address of a buffer (buffer 0 on bad index)
  * PNMB also fills the physical address
@@ -1959,6 +1964,10 @@ NMB(struct netmap_adapter *na, struct netmap_slot *slot)
 {
 	struct lut_entry *lut = na->na_lut.lut;
 	uint32_t i = slot->buf_idx;
+#ifdef CONFIG_SMPD_OPTION_AOE
+	if (i >= AOE_LUT_INDEX)
+		return ext_lut[i - AOE_LUT_INDEX].vaddr;
+#endif
 	return (unlikely(i >= na->na_lut.objtotal)) ?
 		lut[0].vaddr : lut[i].vaddr;
 }

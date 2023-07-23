@@ -118,6 +118,16 @@ nm_os_get_mbuf(struct ifnet *ifp, int len)
 #include <dev/netmap/netmap_kern.h>
 #include <dev/netmap/netmap_mem2.h>
 
+/* Audio over Ether */
+#ifdef CONFIG_SMPD_OPTION_AOE
+#include <sound/pcm.h>
+#include <linux/module.h>
+extern struct snd_dma_buffer *aoe_buf;
+extern struct ext_slot *ext;
+extern struct lut_entry ext_lut[AOE_NUM_SLOTS];
+int audio_over_ether = 0; /* 0:Client 1:Server */
+module_param(audio_over_ether, int, S_IRUGO);
+#endif
 
 #define for_each_kring_n(_i, _k, _karr, _n) \
 	for ((_k)=*(_karr), (_i) = 0; (_i) < (_n); (_i)++, (_k) = (_karr)[(_i)])
@@ -227,6 +237,56 @@ generic_netmap_unregister(struct netmap_adapter *na)
 	struct netmap_kring *kring = NULL;
 	int i, r;
 
+#ifdef CONFIG_SMPD_OPTION_AOE
+	/* restore lookup table */
+	if (aoe_buf && audio_over_ether && ext_lut[0].vaddr != NULL) {
+		int i;
+		int tmp, j;
+		struct netmap_ring *ring;
+
+		nm_prinf("restore lookup table");
+		for (i=0; i < AOE_NUM_SLOTS; i++) {
+			ext_lut[i].vaddr = NULL;
+		}
+
+		ring = na->rx_rings[0]->ring;		// HW RXRING
+		for (i = 0; i < ring->num_slots; i++) {
+			if (ring->slot[i].buf_idx >= AOE_LUT_INDEX) {
+				for (j = 0; j < AOE_NUM_SLOTS; j++) {
+					if (ext->slot[j].buf_idx < AOE_LUT_INDEX) {
+						tmp = ring->slot[i].buf_idx;
+						ring->slot[i].buf_idx = ext->slot[j].buf_idx;
+						ext->slot[j].buf_idx = tmp;
+						break;
+					}
+				}
+			}
+		}
+
+		ring = na->tx_rings[na->num_tx_rings]->ring; // HOST TXRING
+		for (i = 0; i < ring->num_slots; i++) {
+			if (ring->slot[i].buf_idx >= AOE_LUT_INDEX) {
+				for (j = 0; j < AOE_NUM_SLOTS; j++) {
+					if (ext->slot[j].buf_idx < AOE_LUT_INDEX) {
+						tmp = ring->slot[i].buf_idx;
+						ring->slot[i].buf_idx = ext->slot[j].buf_idx;
+						ext->slot[j].buf_idx = tmp;
+						break;
+					}
+				}
+			}
+		}
+		// RXRING[0] buf_idx 2~1025
+		for (i = NM_NUM_SLOTS + 1; i > 1; i--) {
+			na->na_lut.lut[i].vaddr = na->na_lut.lut[i+1].vaddr - NM_BUFSZ;
+		}
+		// TXRING[5] buf_idx 7170~8193
+		for (i = 0; i < NM_NUM_SLOTS; i++) {
+			na->na_lut.lut[i + HOST_TXRING_IDX0].vaddr = na->na_lut.lut[i + HOST_TXRING_IDX0 - 1].vaddr + NM_BUFSZ;
+		}
+	}
+#endif
+
 	if (na->active_fds == 0) {
 		na->na_flags &= ~NAF_NETMAP_ON;
 
@@ -315,7 +375,26 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 		/* This is actually an unregif. */
 		return generic_netmap_unregister(na);
 	}
+#ifdef CONFIG_SMPD_OPTION_AOE
+	if (aoe_buf && audio_over_ether && ext_lut[0].vaddr == NULL) {
+		int i;
+		for (i=0; i < AOE_NUM_SLOTS; i++) {
+			ext_lut[i].vaddr = aoe_buf->area + AOE_BUF_SIZE + NM_BUFSZ * i;
+		}
+		nm_prinf("ext_lut[ 0].vaddr :0x%016llx (%p)", (unsigned long long)(ext_lut[0].vaddr), ext_lut[0].vaddr);
+		nm_prinf(" na_lut[ 0].vaddr :0x%016llx (%p)", (unsigned long long)(na->na_lut.lut[0].vaddr), na->na_lut.lut[0].vaddr);
 
+		// RXRING[0] buf_idx 2~1025
+		for (i = 0; i < NM_NUM_SLOTS; i++) {
+			na->na_lut.lut[HW_RXRING_IDX0 + i].vaddr = aoe_buf->area + NM_BUFSZ * i;
+		}
+		// TXRING[5] buf_idx 7170~8193
+		for (i = 0; i < NM_NUM_SLOTS; i++) {
+			na->na_lut.lut[HOST_TXRING_IDX0 + i].vaddr = aoe_buf->area + NM_BUFSZ * (NM_NUM_SLOTS + i);
+		}
+
+	}
+#endif
 	if (na->active_fds == 0) {
 		nm_prinf("Emulated adapter for %s activated", na->name);
 		/* Do all memory allocations when (na->active_fds == 0), to
@@ -814,7 +893,6 @@ int
 generic_rx_handler(if_t ifp, struct mbuf *m)
 {
 	struct netmap_adapter *na = NA(ifp);
-	struct netmap_generic_adapter *gna = (struct netmap_generic_adapter *)na;
 	struct netmap_kring *kring;
 	u_int work_done;
 	u_int r = MBUF_RXQ(m); /* receive ring number */
@@ -824,7 +902,19 @@ generic_rx_handler(if_t ifp, struct mbuf *m)
 	}
 
 	kring = na->rx_rings[r];
+#ifdef CONFIG_SMPD_OPTION_AOE
+	mbq_safe_enqueue(&kring->rx_queue, m);
 
+	/* If not in the process of a data request, notify immediately. */
+	if (ext->unarrived_dreq_packets == 0) {
+		netmap_generic_irq(na, r, &work_done);
+	} else if (ext->unarrived_dreq_packets <= mbq_len(&kring->rx_queue)) {
+		/* When there are packets awaiting arrival, wait until the queue accumulates packets. */
+		kring->nr_kflags |= NKR_PENDINTR;
+		return kring->nm_notify(kring, 0);
+	}
+#else
+	struct netmap_generic_adapter *gna = (struct netmap_generic_adapter *)na;
 	if (kring->nr_mode == NKR_NETMAP_OFF) {
 		/* We must not intercept this mbuf. */
 		return 0;
@@ -861,6 +951,7 @@ generic_rx_handler(if_t ifp, struct mbuf *m)
 			nm_os_mitigation_start(&gna->mit[r]);
 		}
 	}
+#endif
 
 	/* We have intercepted the mbuf. */
 	return 1;
