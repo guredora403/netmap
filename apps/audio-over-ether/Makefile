@@ -6,7 +6,7 @@ SRCDIR ?= ../..
 VSOUND_HEADER_DIR = $(SRCDIR)/../vsound
 BUILDDIR = $(SRCDIR)
 CLEANFILES = $(PROGS) *.o
-PROGS	=	aoe aoeserver aoeserver-gen
+PROGS	=	aoe aoebridge aoebridge-gen
 
 CLI_FLAGS = -DCLI
 CLI_FLAGS += -DLOG
@@ -25,7 +25,6 @@ CFLAGS += -mcpu=cortex-a72 -march=armv8-a+crc -mtune=cortex-a72
 CFLAGS += -fno-stack-protector
 CFLAGS += -fno-semantic-interposition
 CFLAGS += -fno-math-errno
-CFLAGS += -I $(SRCDIR)/sys -I $(SRCDIR)/apps/include -I $(SRCDIR)/libnetmap
 CFLAGS += -I $(VSOUND_HEADER_DIR)
 LDLIBS += -lm -lrt -lasound
 LDFLAGS = -L./
@@ -51,32 +50,33 @@ all: clean aoe
 clean:
 	-@rm -rf $(CLEANFILES)
 
-# aoeserver (PGO generate)
+# aoebridge (PGO generate)
 gen: CFLAGS += -fprofile-generate -fprofile-correction
 gen: CFLAGS += -ffunction-sections -fdata-sections -fomit-frame-pointer -flto
 gen: LDFLAGS += -Wl,-flto -Wl,--gc-sections -Wl,--no-as-needed
-gen: clean aoeserver
+gen: clean aoebridge
 
-# aoeserver (PGO use)
+# aoebridge (PGO use)
 use: CFLAGS += -fprofile-use -fprofile-correction
 use: CFLAGS += -ffunction-sections -fdata-sections -fomit-frame-pointer -flto
 use: LDFLAGS += -Wl,-flto -Wl,--gc-sections -Wl,--no-as-needed
-use: clean aoeserver
-	size -G aoeserver
-	strip aoeserver
-	ls -al aoeserver
-	md5sum aoeserver
+use: clean aoebridge
+	size -G aoebridge
+	strip aoebridge
+	ls -al aoebridge
+	md5sum aoebridge
 
 # aoe
 aoe: CFLAGS += -ffunction-sections -fdata-sections -fomit-frame-pointer -flto
 aoe: LDFLAGS += -flto
-aoe: aoe.o nmctx.o  nmctx-pthreads.o  nmport.o  nmreq.o
-aoe.o: aoe.c
+aoe: aoe.o
+aoe.o: aoecli.c
 	$(CC) $(CFLAGS) $(WARN_FLAGS) $(CLI_FLAGS) -c $^ -o $@
 
-# aoeserver
-aoeserver: CFLAGS += -ffunction-sections -fdata-sections -fomit-frame-pointer -flto
-aoeserver: LDFLAGS += -flto
-aoeserver: aoeserver.o nmctx.o  nmctx-pthreads.o  nmport.o  nmreq.o
-aoeserver.o: aoe.c
+# aoebridge
+aoebridge: CFLAGS += -ffunction-sections -fdata-sections -fomit-frame-pointer -flto
+aoebridge: CFLAGS += -I $(SRCDIR)/sys -I $(SRCDIR)/apps/include -I $(SRCDIR)/libnetmap
+aoebridge: LDFLAGS += -flto
+aoebridge: aoebridge.o nmctx.o  nmctx-pthreads.o  nmport.o  nmreq.o
+aoebridge.o: aoe.c
 	$(CC) $(CFLAGS) $(WARN_FLAGS) $(SVR_FLAGS) -c $^ -o $@

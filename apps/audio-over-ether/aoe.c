@@ -40,7 +40,7 @@ static struct ext_slot *ext;
 static void usage(int errcode)
 {
 #ifdef SVR
-	const char *cmd = "aoeserver";
+	const char *cmd = "aoebridge";
 #endif
 #ifdef CLI
 	const char *cmd = "aoe";
@@ -259,7 +259,7 @@ static void source_hwaddr(const char *ifname, struct ether_addr *host)
 
 #define MIN_PAYLEN	60 - sizeof(struct ether_header) - sizeof(struct aoe_header)
 static void
-update_packet(struct pkt * pkt, struct ether_addr * src, struct ether_addr * dst,
+update_packet(struct aoe_packet * pkt, struct ether_addr * src, struct ether_addr * dst,
 		enum command cmd, uint8_t sub, uint32_t opt1, uint32_t opt2, uint16_t paylen)
 {
 	/* copy ether header */
@@ -294,7 +294,7 @@ update_packet(struct pkt * pkt, struct ether_addr * src, struct ether_addr * dst
  * and return the starting address of the buffer.
  * Pay attention to setting the payload length at this point.
  */
-static struct pkt * prepare_tx_packet(struct targ * targ, struct ether_addr * src, struct ether_addr * dst,
+static struct aoe_packet * prepare_tx_packet(struct targ * targ, struct ether_addr * src, struct ether_addr * dst,
 		enum command cmd, uint8_t sub, uint32_t opt1, uint32_t opt2, uint16_t paylen)
 {
 	int i;
@@ -310,7 +310,7 @@ static struct pkt * prepare_tx_packet(struct targ * targ, struct ether_addr * sr
 		u_int head = txring->head;
 		struct netmap_slot *slot = &txring->slot[head];
 
-		struct pkt *pkt = (struct pkt *)NETMAP_BUF(txring, slot->buf_idx);
+		struct aoe_packet *pkt = (struct aoe_packet *)NETMAP_BUF(txring, slot->buf_idx);
 		update_packet(pkt, src, dst, cmd, sub, opt1, opt2, paylen);
 
 		/* Please be aware that the payload length may not meet the minimum size of the Ethernet frame. */
@@ -434,7 +434,7 @@ static void send_close(struct targ *targ, struct ether_addr *src, struct ether_a
 	 *	u32opt2	0 (not use)
 	 */
 	char * payload = "Good Bye";
-	struct pkt * _pkt = prepare_tx_packet(targ, src, dst, C_CLOSE, 0, 0, 0, strlen(payload));
+	struct aoe_packet * _pkt = prepare_tx_packet(targ, src, dst, C_CLOSE, 0, 0, 0, strlen(payload));
 	memcpy(_pkt->body, payload, strlen(payload));
 
 	targ->stat = CLOSED;
@@ -448,7 +448,7 @@ static void send_close(struct targ *targ, struct ether_addr *src, struct ether_a
 static inline int
 unbox(void * buf, struct ether_addr * src, struct ether_addr * dst)
 {
-	struct pkt * _pkt;
+	struct aoe_packet * _pkt;
 #ifdef SVR
 	struct netmap_slot * const slot = s.cur_slot;
 #endif
@@ -997,7 +997,7 @@ static void pcm_rate_changed
 
 int main(int arc, char **argv)
 {
-//	struct pkt pkt;
+//	struct aoe_packet pkt;
 	struct ether_addr src, dst;
 #ifdef SVR
 	s = (struct server_stats){ 0 };
@@ -1203,7 +1203,7 @@ int main(int arc, char **argv)
 							memset(&dst, 0xff, 6); // Broadcast
 
 						char * payload = "Neighbor Discovery";
-						struct pkt * _pkt = prepare_tx_packet(&g, &src, &dst, C_DISCOVER, (uint8_t)c.pcm.format, c.pcm.rate, c.pcm.channels, strlen(payload));
+						struct aoe_packet * _pkt = prepare_tx_packet(&g, &src, &dst, C_DISCOVER, (uint8_t)c.pcm.format, c.pcm.rate, c.pcm.channels, strlen(payload));
 						memcpy(_pkt->body, payload, strlen(payload));
 						c.last_ts = c.cur_ts;
 						g.poll_timeout_ms = BROADCAST_MS;
@@ -1257,7 +1257,7 @@ int main(int arc, char **argv)
 					s.last_ts = s.cur_ts;
 					ext->unarrived_dreq_packets = s.req < s.recv_limits ? s.req:s.recv_limits ;
 					char * payload = "Data Request";
-					struct pkt * _pkt = prepare_tx_packet(&g, &src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, strlen(payload));
+					struct aoe_packet * _pkt = prepare_tx_packet(&g, &src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, strlen(payload));
 					memcpy(_pkt->body, payload, strlen(payload));
 				} else {
 					/* round down */
@@ -1294,7 +1294,7 @@ int main(int arc, char **argv)
 						/* DREQ */
 						ext->unarrived_dreq_packets = s.req = 1;
 						char * payload = "Data Request";
-						struct pkt * _pkt = prepare_tx_packet(&g, &src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, strlen(payload));
+						struct aoe_packet * _pkt = prepare_tx_packet(&g, &src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, strlen(payload));
 						memcpy(_pkt->body, payload, strlen(payload));
 					}
 				} else {
@@ -1378,7 +1378,7 @@ int main(int arc, char **argv)
 				memset(&dummy_host, 0xff, 6);
 			}
 			char * payload = "Query";
-			struct pkt * _pkt = prepare_tx_packet(&g, &src, &dummy_host, C_QUERY, c.sig, c.pcm.aoe_mixer_value, 0, strlen(payload));
+			struct aoe_packet * _pkt = prepare_tx_packet(&g, &src, &dummy_host, C_QUERY, c.sig, c.pcm.aoe_mixer_value, 0, strlen(payload));
 			memcpy(_pkt->body, payload, strlen(payload));
 			c.sig = 0;
 		}

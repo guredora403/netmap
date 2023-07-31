@@ -2,6 +2,8 @@
 #define MTU_ETH		1500
 #define MAX_BODYSIZE	MTU_ETH - sizeof(struct ether_header) - sizeof(struct aoe_header)
 
+#define AOE_MIN_PAYLEN	60 - sizeof(struct ether_header) - sizeof(struct aoe_header)
+
 enum Mode	{SERVER, CLIENT};
 enum Status	{CONNECTED, CLOSED, SYN, TEARDOWN, EXIT};
 #if defined(LOG) || defined(CLI)
@@ -20,7 +22,7 @@ enum command{
 	C_CLOSE		// Close
 };
 
-struct pkt {
+struct aoe_packet {
 	struct ether_header eh;
 	struct aoe_header aoe;
 	uint8_t body[MAX_BODYSIZE];	/* hardwired */
