@@ -15,7 +15,7 @@
 #define IOCTL_PCM_START	_IO('a', 0)
 #define IOCTL_PCM_STOP	_IO('a', 1)
 
-#define MTU					1500
+/* Netmap, AoE */
 #define NM_BUFSZ			2048
 #define NM_NUM_SLOTS		1024
 #define AOE_NUM_SLOTS		1024
@@ -38,6 +38,10 @@ struct ether_header
 } __attribute__ ((__packed__));
 #endif
 
+#define ETHERTYPE_LE2		0x88b6	/* IEEE Std 802 - Local Experimental Ethertype 2. */
+#define MTU_ETH				1500
+#define AOE_MAX_PAYLEN		MTU_ETH - sizeof(struct ether_header) - sizeof(struct aoe_header)
+#define AOE_MIN_PAYLEN		60 - sizeof(struct ether_header) - sizeof(struct aoe_header)
 struct aoe_header {
 	uint16_t u16key;	/* session key */
 	uint8_t  u8cmd;		/* command */
@@ -48,6 +52,13 @@ struct aoe_header {
 	uint16_t u16sum;
 } __attribute__ ((__packed__));
 
+struct aoe_packet {
+	struct ether_header eh;
+	struct aoe_header aoe;
+	uint8_t body[AOE_MAX_PAYLEN];
+} __attribute__((__packed__));
+
+/* shared data */
 struct slot {
 	uint32_t buf_idx;	/* buffer index */
 };

@@ -1,10 +1,14 @@
-#define ETHERTYPE_LE2	0x88b6	/* IEEE Std 802 - Local Experimental Ethertype 2. */
-#define MTU_ETH		1500
-#define MAX_BODYSIZE	MTU_ETH - sizeof(struct ether_header) - sizeof(struct aoe_header)
+#define BILLION				1000000000
+#define MAX_IFNAMELEN		64	/* our buffer for ifname */
+#define DEFAULT_TIMEOUT_MS	50
+#define TIMEOUT_LIMITS		20
 
-#define AOE_MIN_PAYLEN	60 - sizeof(struct ether_header) - sizeof(struct aoe_header)
+/* Query sub command */
+#define SIGMIXERCHG	90	/* signal number for extra command (hardware volume control) */
+#define MODEL_SPEC	0	/* Model Spec Request */
 
-enum Mode	{SERVER, CLIENT};
+#define timespec_diff_ns(from, to)	(BILLION * (to.tv_sec - from.tv_sec) + to.tv_nsec - from.tv_nsec)
+
 enum Status	{CONNECTED, CLOSED, SYN, TEARDOWN, EXIT};
 #if defined(LOG) || defined(CLI)
 static const char Connects[5][10] = {
@@ -21,12 +25,6 @@ enum command{
 	C_REPORT,	// Report
 	C_CLOSE		// Close
 };
-
-struct aoe_packet {
-	struct ether_header eh;
-	struct aoe_header aoe;
-	uint8_t body[MAX_BODYSIZE];	/* hardwired */
-} __attribute__((__packed__));
 
 #ifdef CSUM
 static uint32_t checksum(const void *data, uint16_t len, uint32_t sum)
@@ -57,6 +55,19 @@ static __inline uint16_t cksum_add(uint16_t sum, uint16_t a)
 	uint16_t res = sum + a;
 	return (res + (res < a));
 }
+#endif
+
+#ifdef LOG
+#define P(_fmt, ...)							\
+	do {								\
+		struct timeval _t0;					\
+		gettimeofday(&_t0, NULL);				\
+		fprintf(stderr, "%03d.%06d %-9s [%4d] %5u| " _fmt "\n",	\
+		    (int)(_t0.tv_sec % 1000), (int)_t0.tv_usec,		\
+		    __FUNCTION__, __LINE__, g.key, ##__VA_ARGS__);	\
+        } while (0)
+#else
+#define P(_fmt, ...)	do {} while (0)
 #endif
 
 /*

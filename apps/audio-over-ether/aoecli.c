@@ -1,12 +1,10 @@
-#include <time.h>
 #include <limits.h>
-#include <ifaddrs.h>		/* getifaddrs */
 #include <signal.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
-#include <arpa/inet.h>		/* ntohs */
+#include <arpa/inet.h>			/* ntohs */
 #include <linux/if_packet.h>    /* sockaddr_ll */
 #include <netinet/ether.h>
 #include <net/if.h>
@@ -17,24 +15,11 @@
 #include "vsound.h"
 #include "aoe.h"
 
-#define BILLION		1000000000
-#define MAX_IFNAMELEN	64	/* our buffer for ifname */
-
-#define CAP		64
-#define BROADCAST_MS	200
-#define SYN_TIMEOUT_MS	1000
-#define DEFAULT_TIMEOUT_MS	50
-#define BASE_TIMEOUT_MS		s.pcm.period_us * AOE_NUM_SLOTS/1000
-#define DREQ_TIMEOUT_MS		(BASE_TIMEOUT_MS * 3/4)
-#define TIMEOUT_LIMITS	20
-#define MAX_EVENTS 10
-
-#define SIGMIXERCHG	90	/* signal number for extra command (hardware volume control) */
+#define BROADCAST_MS	500
+#define MAX_EVENTS		10
 
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
-
-#define timespec_diff_ns(from, to)	(BILLION * (to.tv_sec - from.tv_sec) + to.tv_nsec - from.tv_nsec)
 
 static void usage(int errcode)
 {
@@ -52,7 +37,7 @@ static void usage(int errcode)
 	exit(errcode);
 }
 
-struct targ {
+struct globals {
 	enum Status stat;
 	uint16_t key;
 	int poll_timeout_ms;
@@ -66,9 +51,9 @@ struct targ {
 	int epoll_fd;
 	char if_name[MAX_IFNAMELEN];
 };
-static struct targ g;
+static struct globals g;
 
-#define PACKET_BUFFER_SIZE sizeof(struct ether_header) + MTU
+#define PACKET_BUFFER_SIZE sizeof(struct ether_header) + MTU_ETH
 static char tx_buf[PACKET_BUFFER_SIZE];
 static char rx_buf[PACKET_BUFFER_SIZE];
 
@@ -78,6 +63,7 @@ struct client_stats {
 	struct timespec cur_ts;
 	struct timespec last_ts;
 	struct vsound_pcm pcm;
+	struct vsound_pcm session_pcm;
 	uint32_t last_mixer_value;
 	unsigned long readtimeout_count;
 	unsigned long eof_count;
@@ -85,21 +71,8 @@ struct client_stats {
 };
 static struct client_stats c;
 
-#ifdef LOG
-#define P(_fmt, ...)							\
-	do {								\
-		struct timeval _t0;					\
-		gettimeofday(&_t0, NULL);				\
-		fprintf(stderr, "%03d.%06d %-9s [%4d] %5u| " _fmt "\n",	\
-		    (int)(_t0.tv_sec % 1000), (int)_t0.tv_usec,		\
-		    __FUNCTION__, __LINE__, g.key, ##__VA_ARGS__);	\
-        } while (0)
-#else
-#define P(_fmt, ...)	do {} while (0)
-#endif
-
 #define READ_SLEEP_US	1000000 * 10 / c.pcm.rate
-#define MAX_LOOP	2500
+#define MAX_LOOP		2500
 static int read_stats(void)
 {
 	return read(g.read_fd, &c.pcm, 0);
@@ -220,6 +193,17 @@ static void send_packet(struct aoe_packet * pkt)
 		teardown("sendto fail");
 }
 
+static void send_query_model(struct ether_addr *src, struct ether_addr *dst)
+{
+	/* C_QUERY (Query)
+	 *	u8cmd	C_QUERY
+	 *	u8sub	signal
+	 *	u32opt1	mixer_value
+	 *	u32opt2	0 (not use)
+	 */
+	struct aoe_packet * _pkt = prepare_tx_packet(src, dst, g.key, C_QUERY, MODEL_SPEC, 0, 0, 0);
+	send_packet(_pkt);
+}
 static void send_close(struct ether_addr *src, struct ether_addr *dst)
 {
 	/* C_CLOSE (Close)
@@ -233,14 +217,14 @@ static void send_close(struct ether_addr *src, struct ether_addr *dst)
 	memcpy(_pkt->body, payload, strlen(payload));
 	send_packet(_pkt);
 
+	c.session_pcm = (struct vsound_pcm) {0};
 	g.stat = CLOSED;
 	g.key = 0;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
 	c.last_mixer_value = 0;
 }
 
-static inline int
-unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, struct ether_addr * dst)
+static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, struct ether_addr * dst)
 {
 	struct aoe_packet * tx_pkt;
 	struct ether_header * eh = (struct ether_header *)rx_pkt;
@@ -284,13 +268,18 @@ unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, struct ether_addr * d
 				}
 				break;
 			}
-			c.chunk_bytes = (int)ntohl(aoe->u32opt1);
+			/* update session pcm info */
+			c.session_pcm.rate = c.pcm.rate;
+			c.session_pcm.format = c.pcm.format;
+			c.session_pcm.channels = c.pcm.channels;
+			g.stat = CONNECTED;
 			g.key = (uint16_t)ntohl(aoe->u32opt2);
+			g.poll_timeout_ms = -1;
+			c.chunk_bytes = (int)ntohl(aoe->u32opt1);
+
 			P("recv *SYN* from " ETHER_ADDR_FMT ", %s->CONNECTED chunk_bytes:%d, send *ACK*",
 				ETHER_ADDR_PTR((struct ether_addr *)&eh->ether_shost),
 				Connects[g.stat], c.chunk_bytes);
-			g.stat = CONNECTED;
-			g.poll_timeout_ms = -1;
 
 			// update dst only
 			if (g.options & OPT_AUTO)
@@ -312,6 +301,19 @@ unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, struct ether_addr * d
 			break;
 		case C_REPORT:	/* CLIENT side */
 			P("recv *REPORT(%u)* (%uB)", aoe->u8sub, ntohs(aoe->u16len));
+
+			/* recieve Model Spec Report */
+			if (aoe->u8sub == MODEL_SPEC) {
+				struct ether_addr _tmp;
+				memcpy(&_tmp, &eh->ether_shost, 6);
+				if (g.options & OPT_AUTO || memcmp(&_tmp, dst, 6) == 0) {
+					struct vsound_model * model = (struct vsound_model*)rx_payload;
+					ioctl(g.read_fd, IOCTL_VSOUND_APPLY_MODEL, model);
+					P("Apply the model spec (name:%s)", model->name);
+				}
+				break;
+			}
+
 			int _fd = open("/run/report", O_CREAT|O_WRONLY|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
 			if (_fd) {
 				if (aoe->u8sub == SIGUSR1) {
@@ -357,7 +359,7 @@ int main(int arc, char **argv)
 {
 	struct ifreq ifr;
 	struct ether_addr src, dst;
-	g = (struct targ){ 0 };
+	g = (struct globals){ 0 };
 	g.stat = CLOSED;
 	g.options |= OPT_AUTO;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
@@ -445,13 +447,22 @@ int main(int arc, char **argv)
 	if (epoll_ctl(g.epoll_fd, EPOLL_CTL_ADD, g.sock_fd, &event) == -1)
 		teardown("epoll_ctl fail");
 
+	/* Model Spec Request */
+	send_query_model(&src, &dst);
+	P("send *Query(Model Spec Request)*");
+
 	/* main loop */
 	unsigned int timeout_count = 0;
 	while (1) {
 		clock_gettime(CLOCK_MONOTONIC, &c.cur_ts);
+
+		/* read vsound status */
 		read_stats();
-		if (c.pcm.closed && g.stat == CONNECTED) {
-			P("send *Close*");
+		if (g.stat == CONNECTED && (
+				 c.pcm.format != c.session_pcm.format
+			  || c.pcm.rate != c.session_pcm.rate
+			  || c.pcm.channels != c.session_pcm.channels) ) {
+			P("send *Close* pcm information has been modified.");
 			send_close(&src, &dst);
 		} else {
 			switch (c.pcm.state) {
@@ -462,7 +473,7 @@ int main(int arc, char **argv)
 							P("Neighbor Discovery reach the upper limit!, PCM Suspended");
 							timeout_count = 0;
 							/* pcm suspend */
-							ioctl(g.read_fd, 0, NULL);
+							ioctl(g.read_fd, IOCTL_VSOUND_STOP_IMMEDIATELY, NULL);
 							break;
 						}
 
@@ -479,6 +490,7 @@ int main(int arc, char **argv)
 						struct aoe_packet * tx_pkt = prepare_tx_packet(&src, &dst, g.key, C_DISCOVER, (uint8_t)c.pcm.format, c.pcm.rate, c.pcm.channels, strlen(payload));
 						memcpy(tx_pkt->body, payload, strlen(payload));
 						send_packet(tx_pkt);
+
 						c.last_ts = c.cur_ts;
 						g.poll_timeout_ms = BROADCAST_MS;
 						P("send *Neighbor Discovery* SND_PCM_STATE:%s(%d) %s %u %u",
@@ -503,7 +515,7 @@ int main(int arc, char **argv)
 				break;
 			}
 			/* digital volume */
-			if (g.stat == CONNECTED && c.last_mixer_value != c.pcm.aoe_mixer_value) {
+			if (g.stat == CONNECTED && c.last_mixer_value != c.pcm.mixer_value) {
 				c.sig = SIGMIXERCHG;
 			}
 		}
@@ -536,17 +548,16 @@ int main(int arc, char **argv)
 			struct ether_addr dummy_host = {0};
 			if (c.sig == SIGMIXERCHG) {
 				memcpy(&dummy_host, &dst, 6);
-				struct aoe_param before = get_aoe_param(&c.last_mixer_value);
-				struct aoe_param after = get_aoe_param(&c.pcm.aoe_mixer_value);
-				P("send *Query* Mixer Change: v%d d%d r%d -> v%d d%d r%d (%06x)",
-					before.volume, before.dreq, before.recv,
-					after.volume, after.dreq, after.recv, c.pcm.aoe_mixer_value);
-				c.last_mixer_value = c.pcm.aoe_mixer_value;
+				struct vsound_control before = get_vsound_control(&c.last_mixer_value);
+				struct vsound_control after = get_vsound_control(&c.pcm.mixer_value);
+				P("send *Query* Mixer Change: volume:%d -> %d (%06x)",
+					before.volume, after.volume, c.pcm.mixer_value);
+				c.last_mixer_value = c.pcm.mixer_value;
 			} else if (g.options & OPT_AUTO || c.sig == SIGUSR1) {	/* show server status (lsaoe) */
 				memset(&dummy_host, 0xff, 6);
 			}
 			char * payload = "Query";
-			struct aoe_packet * tx_pkt = prepare_tx_packet(&src, &dummy_host, g.key, C_QUERY, c.sig, c.pcm.aoe_mixer_value, 0, strlen(payload));
+			struct aoe_packet *tx_pkt = prepare_tx_packet(&src, &dummy_host, g.key, C_QUERY, c.sig, c.pcm.mixer_value, 0, strlen(payload));
 			memcpy(tx_pkt->body, payload, strlen(payload));
 			send_packet(tx_pkt);
 			c.sig = 0;
@@ -562,7 +573,6 @@ int main(int arc, char **argv)
 		}
 	}
 END:
-	P("reach END: label");
 	teardown(NULL);
 	return 0;
 }

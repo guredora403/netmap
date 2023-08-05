@@ -1,17 +1,15 @@
 #settings
 CC=clang
 LD=ld.lld
-VERSION = 1.0RC1
+VERSION = 1.0RC2
 SRCDIR ?= ../..
 VSOUND_HEADER_DIR = $(SRCDIR)/../vsound
 BUILDDIR = $(SRCDIR)
 CLEANFILES = $(PROGS) *.o
 PROGS	=	aoe aoebridge aoebridge-gen
 
-CLI_FLAGS = -DCLI
 CLI_FLAGS += -DLOG
 
-SVR_FLAGS = -DSVR
 SVR_FLAGS += -DSERVER_STATS
 SVR_FLAGS += -DLOG
 
@@ -78,5 +76,5 @@ aoebridge: CFLAGS += -ffunction-sections -fdata-sections -fomit-frame-pointer -f
 aoebridge: CFLAGS += -I $(SRCDIR)/sys -I $(SRCDIR)/apps/include -I $(SRCDIR)/libnetmap
 aoebridge: LDFLAGS += -flto
 aoebridge: aoebridge.o nmctx.o  nmctx-pthreads.o  nmport.o  nmreq.o
-aoebridge.o: aoe.c
+aoebridge.o: aoebridge.c
 	$(CC) $(CFLAGS) $(WARN_FLAGS) $(SVR_FLAGS) -c $^ -o $@
