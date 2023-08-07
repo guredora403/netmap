@@ -18,9 +18,7 @@
 
 #define MAX_ARGLEN		64
 #define CAP				64
-#define SYN_TIMEOUT_MS	1000
-#define BASE_TIMEOUT_MS	s.pcm.period_us * AOE_NUM_SLOTS/1000
-#define DREQ_TIMEOUT_MS	(BASE_TIMEOUT_MS * 3/4)
+#define SYN_TIMEOUT_MS	2000
 #define REMOTE_COMMAND	"/usr/local/bin/aoecmd.sh"
 
 static void usage(int errcode)
@@ -61,8 +59,6 @@ static struct globals g;
 
 struct event_count {
 	unsigned long error;
-	unsigned long timeout;
-	unsigned long recover;
 };
 struct stats {
 	unsigned long min;
@@ -242,13 +238,8 @@ static void signal_handler(int sig)
 
 static inline void * idx_to_bufp (unsigned long idx)
 {
-	if (idx >= AOE_LUT_INDEX) {
-		unsigned long idx2 = idx - AOE_LUT_INDEX;
-		return (void *)g.aoe_buf_addr + AOE_BUF_SIZE + NM_BUFSZ * idx2;
-	} else {
-		idx = idx < NM_NUM_SLOTS + HW_RXRING_IDX0 ? (idx - HW_RXRING_IDX0) : (idx + NM_NUM_SLOTS - HOST_TXRING_IDX0);
-		return (void *)g.aoe_buf_addr + NM_BUFSZ * idx;
-	}
+	idx = idx < AOE_LUT_INDEX ? (idx - HW_RXRING_IDX0)%2048 : idx + NM_NUM_SLOTS * 2 - AOE_LUT_INDEX;
+	return (void *)g.aoe_buf_addr + NM_BUFSZ * idx;
 }
 
 static void swapto(int is_hwring, struct netmap_slot * rxslot)
@@ -683,11 +674,13 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				/* show server status (lsaoe) */
 				sprintf(report,
 					"  PCM PARAM  : %s %u %u chunk_bytes:%d period_us:%u\n"
-					"  AoE STATS  : aoe.dreq=%d aoe.recv=%d (count:%lu timeout:%lu recover:%lu)\n"
+					"  AoE STATS  : aoe.dreq=%d aoe.recv=%d (count:%lu)\n"
+					"  DMA STATS  : %s (cb_frames:%d)\n"
 					"  SOUND CARD : %s\n",
 					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels, s.chunk_bytes, s.pcm.period_us,
-					s.dreq_limits, s.recv_limits,
-					s.recv_total, s.ev.timeout, s.ev.recover, g.model.name);
+					s.dreq_limits, s.recv_limits, s.recv_total,
+					ext->stat == ACTIVE ? "ACTIVE":"INACTIVE", s.cb_frames,
+					g.model.name);
 #ifdef CSUM
 				if (g.options & OPT_CSUM) {
 					char _buf[50];
@@ -871,7 +864,6 @@ int main(int arc, char **argv)
 	memset(&pollfd, 0, sizeof(pollfd));
 	pollfd[0].fd = g.nmd->fd;
 	pollfd[0].events = POLLIN;
-	unsigned int timeout_count = 0;
 
 	while (1) {
 		if (likely(g.stat == CONNECTED)) {
@@ -891,12 +883,13 @@ int main(int arc, char **argv)
 					 *	u32opt2	DREQ timespec nsec
 					 */
 					s.req = space < s.dreq_limits ? space:s.dreq_limits;
-					timeout_count = 0;
 					s.last_ts = s.cur_ts;
 					ext->unarrived_dreq_packets = s.req < s.recv_limits ? s.req:s.recv_limits ;
-					char * payload = "Data Request";
-					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, strlen(payload));
-					memcpy(_pkt->body, payload, strlen(payload));
+					/* Calculate the playable time from the buffered slots and include it in the payload. */
+					unsigned int buffered_playback_us = avail * s.pcm.period_us;
+					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, sizeof(buffered_playback_us));
+					memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
+					g.poll_timeout_ms = buffered_playback_us / 1000;
 				} else {
 					/* round down */
 					g.poll_timeout_ms = (s.dreq_limits - space) * s.pcm.period_us /1000;
@@ -908,35 +901,12 @@ int main(int arc, char **argv)
 				}
 			} else {
 				/* data request timeout */
-				if (unlikely(timespec_diff_ns(s.last_ts, s.cur_ts) > DREQ_TIMEOUT_MS * 1000000)) {
-#ifdef SERVER_STATS
-					incr(s.ev.timeout);
-#endif
-					s.last_ts = s.cur_ts;
-
-					if (++timeout_count > TIMEOUT_LIMITS) {
-						P("DREQ TIMEOUT reach the upper limit!, send *Close*");
-						timeout_count = 0;
+				if (unlikely(timespec_diff_ns(s.last_ts, s.cur_ts) > s.pcm.period_us * ext->num_slots * 1000)) {
+					if (ext->stat == INACTIVE) {
 						reset(&s);
 						send_close(&src, &dst);
-					} else {
-						P("RECOVER! req:%d recv:%d", s.req, s.recv);
-#ifdef SERVER_STATS
-						incr(s.ev.recover);
-#endif
-						/* RECOVER */
-						__atomic_store_n(&ext->head,
-							(ext->head + s.recv > ext->num_slots -1 ? ext->head + s.recv - ext->num_slots:ext->head+s.recv), __ATOMIC_RELEASE);
-						reset(&s);
-
-						/* DREQ */
-						ext->unarrived_dreq_packets = s.req = 1;
-						char * payload = "Data Request";
-						struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, strlen(payload));
-						memcpy(_pkt->body, payload, strlen(payload));
+						P("send *Close* There is no response to the data request, and DMA has also stopped.");
 					}
-				} else {
-					ext->unarrived_dreq_packets = (s.req - s.recv) < s.recv_limits ? (s.req - s.recv):s.recv_limits ;
 				}
 			}
 		}
@@ -990,9 +960,10 @@ int main(int arc, char **argv)
 		switch (g.stat) {
 		case SYN:/* SYN timeout */
 			if (timespec_diff_ns(s.last_ts, s.cur_ts) > SYN_TIMEOUT_MS * 1000000) {
+				send_close(&src, &dst);
 				g.stat = CLOSED;
 				g.key = 0;
-				P("SYN TIMEOUT!, reset last_ts");
+				P("SYN TIMEOUT!, send *CLOSE*");
 			}
 			break;
 		case CLOSED:

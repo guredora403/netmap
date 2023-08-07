@@ -8,6 +8,7 @@
 #define MODEL_SPEC	0	/* Model Spec Request */
 
 #define timespec_diff_ns(from, to)	(BILLION * (to.tv_sec - from.tv_sec) + to.tv_nsec - from.tv_nsec)
+#define timespec_to_ns(ts)	(uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec
 
 enum Status	{CONNECTED, CLOSED, SYN, TEARDOWN, EXIT};
 #if defined(LOG) || defined(CLI)
@@ -59,11 +60,11 @@ static __inline uint16_t cksum_add(uint16_t sum, uint16_t a)
 
 #ifdef LOG
 #define P(_fmt, ...)							\
-	do {								\
-		struct timeval _t0;					\
-		gettimeofday(&_t0, NULL);				\
-		fprintf(stderr, "%03d.%06d %-9s [%4d] %5u| " _fmt "\n",	\
-		    (int)(_t0.tv_sec % 1000), (int)_t0.tv_usec,		\
+	do {										\
+		struct timespec __ts;					\
+		clock_gettime(CLOCK_MONOTONIC, &__ts);	\
+		fprintf(stderr, "%06ld.%03ld %-9s [%4d] %5u| " _fmt "\n",	\
+		    __ts.tv_sec, __ts.tv_nsec/1000000,	\
 		    __FUNCTION__, __LINE__, g.key, ##__VA_ARGS__);	\
         } while (0)
 #else

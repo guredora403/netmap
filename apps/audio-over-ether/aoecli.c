@@ -71,20 +71,23 @@ struct client_stats {
 };
 static struct client_stats c;
 
-#define READ_SLEEP_US	1000000 * 10 / c.pcm.rate
-#define MAX_LOOP		2500
+//#define READ_SLEEP_US	1000000 * 10 / c.pcm.rate
+//#define MAX_LOOP		2500
+#define READ_SLEEP_US	1000 * 10
+//#define MAX_LOOP		500
 static int read_stats(void)
 {
 	return read(g.read_fd, &c.pcm, 0);
 }
-static int read_buf(int fd, char *buf, int count)
+static int read_buf(int fd, char *buf, int count, uint64_t timeout)
 {
-	int loop = MAX_LOOP, l = 0, r;
+//	int loop = MAX_LOOP
+	int l = 0, r;
 	do {
 		r = read(fd, buf + l, count - l);
 		if (likely(r > 0)) {
 			l += r;
-			loop = MAX_LOOP;
+//			loop = MAX_LOOP;
 			continue;
 		} else if (r == 0) {
 			c.eof_count++;
@@ -98,7 +101,9 @@ static int read_buf(int fd, char *buf, int count)
 				c.eintr_count++;
 				continue;
 			} else if (errno == EAGAIN) {
-				if (--loop > 0) {
+				struct timespec _now;
+				clock_gettime(CLOCK_MONOTONIC, &_now);
+				if (timespec_to_ns(_now) < timeout) {
 					usleep(READ_SLEEP_US);
 					continue;
 				}
@@ -190,7 +195,7 @@ static void send_packet(struct aoe_packet * pkt)
 	int ret;
 	ret = sendto(g.sock_fd, (void *)pkt, tx_len, 0, (struct sockaddr *)&g.sll, sizeof(struct sockaddr_ll));
 	if (ret == -1)
-		teardown("sendto fail");
+		g.stat = TEARDOWN;
 }
 
 static void send_query_model(struct ether_addr *src, struct ether_addr *dst)
@@ -237,11 +242,17 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			if (g.stat != CONNECTED || g.key != ntohs(aoe->u16key))
 				break;
 			int ret = 0;
+			/* Buffer read deadline */
+			unsigned int buffered_playback_us = *((unsigned int*)rx_payload);
+			struct timespec _ts;
+			clock_gettime(CLOCK_MONOTONIC, &_ts);
+			uint64_t limit_ns = timespec_to_ns(_ts) + buffered_playback_us * 1000;
+
+			/* Since all headers are the same, prepare them only once. */
 			tx_pkt = prepare_tx_packet(src, dst, g.key, C_DRES, 0, ntohl(aoe->u32opt1), ntohl(aoe->u32opt2), c.chunk_bytes);
 			for (int i = 0, last = aoe->u8sub; i < last; i++) {
 				tx_pkt->aoe.u8sub	= i;
-				ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes);
-				send_packet(tx_pkt);
+				ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
 				if (likely(ret > 0)) {
 					/* C_DRES (Data Response)
 					 *	u8cmd	C_DRES
@@ -249,6 +260,7 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 					 *	u32opt1	DREQ timespec sec
 					 *	u32opt2	DREQ timespec nsec
 					 */
+					send_packet(tx_pkt);
 				}
 				if (unlikely(ret < c.chunk_bytes)) {
 					P("recv *Data Request*, but buffer read return %d (%d:%s), send *Close*",
@@ -457,7 +469,7 @@ int main(int arc, char **argv)
 		clock_gettime(CLOCK_MONOTONIC, &c.cur_ts);
 
 		/* read vsound status */
-		read_stats();
+		ssize_t avail_bytes = read_stats();
 		if (g.stat == CONNECTED && (
 				 c.pcm.format != c.session_pcm.format
 			  || c.pcm.rate != c.session_pcm.rate
@@ -467,7 +479,8 @@ int main(int arc, char **argv)
 		} else {
 			switch (c.pcm.state) {
 			case SND_PCM_STATE_PREPARED:
-				if (g.stat == CLOSED) {
+			case SND_PCM_STATE_RUNNING:
+				if (g.stat == CLOSED && avail_bytes > 0) {
 					if (timespec_diff_ns(c.last_ts, c.cur_ts) > BROADCAST_MS * 1000000) {
 						if (++timeout_count > TIMEOUT_LIMITS) {
 							P("Neighbor Discovery reach the upper limit!, PCM Suspended");
@@ -493,9 +506,9 @@ int main(int arc, char **argv)
 
 						c.last_ts = c.cur_ts;
 						g.poll_timeout_ms = BROADCAST_MS;
-						P("send *Neighbor Discovery* SND_PCM_STATE:%s(%d) %s %u %u",
+						P("send *Neighbor Discovery* SND_PCM_STATE:%s(%d) %s %u %u (avail_bytes:%ld)",
 							snd_pcm_state_name(c.pcm.state), c.pcm.state,
-							snd_pcm_format_name(c.pcm.format), c.pcm.rate, c.pcm.channels);
+							snd_pcm_format_name(c.pcm.format), c.pcm.rate, c.pcm.channels, avail_bytes);
 					}
 				} else {
 					/* clear count */
@@ -524,7 +537,7 @@ int main(int arc, char **argv)
 		nfds = epoll_wait(g.epoll_fd, events, MAX_EVENTS, g.poll_timeout_ms);
 		if (nfds == -1) {
 			if (errno != EINTR && g.stat != EXIT)
-				teardown("epoll_wait fail");
+				g.stat = TEARDOWN;
 		} else if (nfds == 0) {
 			// timeout
 			continue;
@@ -565,6 +578,7 @@ int main(int arc, char **argv)
 		switch (g.stat) {
 		case TEARDOWN:
 			send_close(&src, &dst);
+			P("send *Close* teardown...");
 			goto END;
 		case EXIT:
 			goto END;

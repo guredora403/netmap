@@ -26,15 +26,20 @@ CFLAGS += -fno-math-errno
 CFLAGS += -I $(VSOUND_HEADER_DIR)
 LDLIBS += -lm -lrt -lasound
 LDFLAGS = -L./
-LDLIBS += -lgcov
+#LDLIBS += -lgcov
 
 # checksum
 #CFLAGS += -DCSUM
 
-# coverage
+# coverage (GCC)
 #CFLAGS += --coverage -O0
 #CFLAGS += -I/usr/lib/gcc/aarch64-unknown-linux-gnu/10.1.0/include/
 #LDFLAGS += -L/usr/lib/gcc/aarch64-unknown-linux-gnu/10.1.0/
+
+
+# coverage (LLVM)
+#CFLAGS += -fprofile-instr-generate -fcoverage-mapping
+#LDFLAGS += -fprofile-instr-generate -fcoverage-mapping
 
 # asm
 #CFLAGS += -g -save-temps=obj
