@@ -293,17 +293,31 @@ unsigned int sndrv_pcm_rate[NUM_RATES] =
 	{(1U<<6), (1U<<7), (1U<<9), (1U<<10), (1U<<11), (1U<<12), (1U<<13), (1U<<14), (1U<<15), (1U<<16)};
 snd_pcm_format_t avail_format[NUM_FORMATS] = {SND_PCM_FORMAT_S16, SND_PCM_FORMAT_S24, SND_PCM_FORMAT_S32};
 
-static void pcm_rate_changed
-	(snd_pcm_format_t format, unsigned int rate, unsigned int channels)
+static void pcm_rate_changed (snd_pcm_format_t format,
+		unsigned int rate, unsigned int channels, ssize_t buffer_bytes)
 {
 	s.pcm.format = format;
 	s.pcm.rate = rate;
 	s.pcm.channels = channels;
+	s.pcm.buffer_bytes = buffer_bytes;
 
 	const size_t bytes_per_sample = snd_pcm_format_physical_width(format)/8;
-	s.period_size = (MTU_ETH - sizeof(struct aoe_header)) / (channels * bytes_per_sample);
+
+	ssize_t packet_buffer_bytes = MTU_ETH - sizeof(struct aoe_header);
+
+	/* Consider the case where the buffer size of vsound is smaller than (MTU - AoE header). */
+	if (buffer_bytes < packet_buffer_bytes) {
+		packet_buffer_bytes = buffer_bytes;
+		packet_buffer_bytes -= buffer_bytes % (channels * bytes_per_sample);
+	}
+
+	s.period_size = packet_buffer_bytes / (channels * bytes_per_sample);
+	s.period_size -= s.period_size % 2;
 	s.chunk_bytes = s.period_size * channels * bytes_per_sample;
 	s.pcm.period_us = 1000000 * s.period_size / rate;
+
+	/* Consideration to ensure that DREQ does not exceed the buffer size of vsound. */
+	int req_limits = buffer_bytes / s.chunk_bytes;
 
 	/*
 	 * Note that ext->num_slots is four times cb_frames.
@@ -313,29 +327,30 @@ static void pcm_rate_changed
 	case 48000:
 	case 44100:
 		s.cb_frames = 32;
-		s.dreq_limits = s.recv_limits = 32;
+		req_limits = (req_limits < 32) ? req_limits:32;
 		break;
 	case 96000:
 	case 88200:
 		s.cb_frames = 64;
-		s.dreq_limits = s.recv_limits = 40;
+		req_limits = (req_limits < 40) ? req_limits:40;
 		break;
 	case 192000:
 	case 176400:
 		s.cb_frames = 128;
-		s.dreq_limits = s.recv_limits = 48;
+		req_limits = (req_limits < 48) ? req_limits:48;
 		break;
 	case 384000:
 	case 352800:
 		s.cb_frames = 256;
-		s.dreq_limits = s.recv_limits = 56;
+		req_limits = (req_limits < 56) ? req_limits:56;
 		break;
 	default:
 		// 768000, 705600, and others
 		s.cb_frames = 256;
-		s.dreq_limits = s.recv_limits = 64;
+		req_limits = (req_limits < 64) ? req_limits:64;
 		break;
 	}
+	s.dreq_limits = s.recv_limits = req_limits;
 }
 
 static void detect_initial_params(void)
@@ -401,7 +416,7 @@ static void detect_initial_params(void)
 		teardown("Stereo channel not supported!");
 	}
 
-	pcm_rate_changed(_format, _rate, _channels);
+	pcm_rate_changed(_format, _rate, _channels, 4096);
 }
 static int pcm_set_params(void)
 {
@@ -461,18 +476,11 @@ static void pcm_ready(void)
 		snd_pcm_drain(g.handle);
 		snd_pcm_close(g.handle);
 	}
-
 	int err = snd_pcm_open(&g.handle, g.pcm_name, SND_PCM_STREAM_PLAYBACK, OPENMODE);
-	if (err < 0) {
+	if (err < 0)
 		teardown("snd_pcm_open failed");
-	} else {
-		P("snd_pcm_open OK!");
-	}
-	if (pcm_set_params() < 0) {
+	if (pcm_set_params() < 0)
 		teardown("pcm_set_params failed");
-	} else {
-		P("pcm_set_params OK!");
-	}
 }
 
 static void send_model_report(struct ether_addr *src, struct ether_addr *dst)
@@ -509,9 +517,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 	struct netmap_slot * const slot = s.cur_slot;
 	struct ether_header * eh = (struct ether_header *)buf;
 	struct aoe_header * aoe = (struct aoe_header *)(eh + 1);
-#if (defined CSUM || defined CLI)
-	char * payload = (char *)(aoe + 1);
-#endif
+	char * rx_payload = (char *)(aoe + 1);
 	if (eh->ether_type == htons(ETHERTYPE_LE2)) {
 		switch (aoe->u8cmd) {
 		case C_DRES: { /* SERVER side */ }
@@ -558,26 +564,34 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			if (g.stat != CLOSED)
 				break;
 
+			clock_gettime(CLOCK_MONOTONIC, &s.last_ts);
+			g.key = (uint16_t)s.last_ts.tv_nsec;
+
 			// format/rate/channels
-			snd_pcm_format_t _format = aoe->u8sub;
-			unsigned int _rate = ntohl(aoe->u32opt1);
-			unsigned int _channels = ntohl(aoe->u32opt2);
+			struct vsound_pcm * pcm = (struct vsound_pcm*)rx_payload;
+			snd_pcm_format_t _format = pcm->format;
+			unsigned int _rate = pcm->rate;
+			unsigned int _channels = pcm->channels;
+			ssize_t _buffer_bytes = pcm->buffer_bytes;
 			if (s.pcm.format != _format
 				|| s.pcm.rate != _rate
-				|| s.pcm.channels != _channels) {
+				|| s.pcm.channels != _channels
+				|| s.pcm.buffer_bytes != _buffer_bytes) {
 
 				// When changing rates, wait until playback is complete.
-				if (ext->head != ext->tail)
-					break;
+				while (ext->stat == ACTIVE)
+					usleep(1000 * 10);
 
 				__atomic_store_n(&ext->head, 0, __ATOMIC_RELEASE);
 				__atomic_store_n(&ext->cur, 0, __ATOMIC_RELEASE);
 				__atomic_store_n(&ext->tail, 0, __ATOMIC_RELEASE);
 
-				pcm_rate_changed(_format, _rate, _channels);
+				pcm_rate_changed(_format, _rate, _channels, _buffer_bytes);
 				pcm_ready();
 				ext->num_slots = s.cb_frames * 4;
-				P("pcminfo %s %u %u chunk_bytes:%d period_us:%u", snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels, s.chunk_bytes, s.pcm.period_us);
+				P("pcminfo changed %s %u %u chunk_bytes:%d period_us:%u buffer:%ldB",
+					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels,
+					s.chunk_bytes, s.pcm.period_us, _buffer_bytes);
 			}
 
 			P("recv *Neighbor Discovery* from " ETHER_ADDR_FMT ", %s->SYN, send *SYN*",
@@ -594,8 +608,6 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			 *	u32opt1	chunk_bytes
 			 *	u32opt2	session key
 			 */
-			clock_gettime(CLOCK_MONOTONIC, &s.last_ts);
-			g.key = (uint16_t)s.last_ts.tv_nsec;
 			char * payload = "Synchronize";
 			_pkt = prepare_tx_packet(src, dst, C_SYN, g.options & OPT_CSUM ? 1:0, (uint32_t)s.chunk_bytes, g.key, strlen(payload));
 			memcpy(_pkt->body, payload, strlen(payload));
@@ -674,7 +686,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				/* show server status (lsaoe) */
 				sprintf(report,
 					"  PCM PARAM  : %s %u %u chunk_bytes:%d period_us:%u\n"
-					"  AoE STATS  : aoe.dreq=%d aoe.recv=%d (count:%lu)\n"
+					"  AoE STATS  : dreq=%d recv=%d (received AoE packets:%lu)\n"
 					"  DMA STATS  : %s (cb_frames:%d)\n"
 					"  SOUND CARD : %s\n",
 					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels, s.chunk_bytes, s.pcm.period_us,
@@ -827,7 +839,8 @@ int main(int arc, char **argv)
 		teardown("SIOCGIFINDEX fail");
 	memcpy(&src, &ifr.ifr_hwaddr.sa_data, 6);
 	close(sock_fd);
-	P("HWaddr " ETHER_ADDR_FMT, ETHER_ADDR_PTR(&src));
+	P("aoebridge %s [%s] HWaddr " ETHER_ADDR_FMT,
+		AOE_VERSION, g.if_name, ETHER_ADDR_PTR(&src));
 
 	/* nmport */
 	char netmapif[100];

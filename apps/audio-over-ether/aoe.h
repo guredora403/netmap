@@ -70,8 +70,8 @@ static __inline uint16_t cksum_add(uint16_t sum, uint16_t a)
 #else
 #define P(_fmt, ...)	do {} while (0)
 #endif
-
 /*
+#include <ctype.h>
 static void hexdump(const char *_p, int len)
 {
 	char buf[128];

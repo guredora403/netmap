@@ -36,7 +36,6 @@ static void usage(int errcode)
 		, cmd, AOE_VERSION);
 	exit(errcode);
 }
-
 struct globals {
 	enum Status stat;
 	uint16_t key;
@@ -57,6 +56,7 @@ static struct globals g;
 static char tx_buf[PACKET_BUFFER_SIZE];
 static char rx_buf[PACKET_BUFFER_SIZE];
 
+enum DoP	{UNKNOWN, DOP, PCM};
 struct client_stats {
 	int chunk_bytes;
 	int sig;
@@ -64,6 +64,7 @@ struct client_stats {
 	struct timespec last_ts;
 	struct vsound_pcm pcm;
 	struct vsound_pcm session_pcm;
+	enum DoP dop;
 	uint32_t last_mixer_value;
 	unsigned long readtimeout_count;
 	unsigned long eof_count;
@@ -71,29 +72,24 @@ struct client_stats {
 };
 static struct client_stats c;
 
-//#define READ_SLEEP_US	1000000 * 10 / c.pcm.rate
-//#define MAX_LOOP		2500
 #define READ_SLEEP_US	1000 * 10
-//#define MAX_LOOP		500
 static int read_stats(void)
 {
 	return read(g.read_fd, &c.pcm, 0);
 }
 static int read_buf(int fd, char *buf, int count, uint64_t timeout)
 {
-//	int loop = MAX_LOOP
 	int l = 0, r;
 	do {
 		r = read(fd, buf + l, count - l);
 		if (likely(r > 0)) {
 			l += r;
-//			loop = MAX_LOOP;
 			continue;
 		} else if (r == 0) {
 			c.eof_count++;
 			if (l > 0) {
 				/* drain */
-				memset(buf + l, '0', count - l);
+				memset(buf + l, 0x00, count - l);
 			}
 			return l;
 		} else {
@@ -111,7 +107,7 @@ static int read_buf(int fd, char *buf, int count, uint64_t timeout)
 			c.readtimeout_count++;
 			if (l > 0) {
 				/* drain */
-				memset(buf + l, '0', count - l);
+				memset(buf + l, 0x00, count - l);
 				return l;
 			}
 			P("read_buf nodata (errno:%d)", errno);
@@ -223,6 +219,7 @@ static void send_close(struct ether_addr *src, struct ether_addr *dst)
 	send_packet(_pkt);
 
 	c.session_pcm = (struct vsound_pcm) {0};
+	c.dop = UNKNOWN;
 	g.stat = CLOSED;
 	g.key = 0;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
@@ -248,9 +245,60 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			clock_gettime(CLOCK_MONOTONIC, &_ts);
 			uint64_t limit_ns = timespec_to_ns(_ts) + buffered_playback_us * 1000;
 
+			int i = 0;
 			/* Since all headers are the same, prepare them only once. */
 			tx_pkt = prepare_tx_packet(src, dst, g.key, C_DRES, 0, ntohl(aoe->u32opt1), ntohl(aoe->u32opt2), c.chunk_bytes);
-			for (int i = 0, last = aoe->u8sub; i < last; i++) {
+
+			/* detect DoP */
+			if (c.dop == UNKNOWN) {
+				if (c.session_pcm.format == SND_PCM_FORMAT_S24) {
+					c.dop = DOP;
+					ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
+					uint16_t * sample = (uint16_t *)tx_pkt->body + 1;
+/*
+//					P("%x %x %x %x %x %x %x %x", *(sample), *(sample + 1), *(sample + 2), *(sample + 3),
+//						*(sample + 4), *(sample + 5), *(sample + 6), *(sample + 7));
+
+					P("%x %x %x %x %x %x %x %x | %x", *(sample - 1), *(sample), *(sample + 1), *(sample + 2), *(sample + 3),
+						*(sample + 4), *(sample + 5), *(sample + 6), *(sample + 7));
+					uint8_t * s = (uint8_t *)tx_pkt->body;
+					P("%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
+						*(s), *(s+1), *(s+2), *(s+3), *(s+4), *(s+5), *(s+6), *(s+7),
+						*(s+8), *(s+9), *(s+10), *(s+11), *(s+12), *(s+13), *(s+14), *(s+15));
+*/
+					for (int idx = 0;  idx < 32; idx++) {
+						if (*sample != 0xff05 && *sample != 0xfffa) {
+							c.dop = PCM;
+							break;
+						}
+						sample += 2;
+					}
+				} else {
+					c.dop = PCM;
+				}
+
+				if (c.dop == DOP && aoe->u8sub > 1) {
+					// silence chunk
+					struct aoe_packet * silence_tx_pkt = prepare_tx_packet(src, dst, g.key, C_DRES, 0,
+						ntohl(aoe->u32opt1), ntohl(aoe->u32opt2), c.chunk_bytes);
+					silence_tx_pkt->aoe.u8sub	= i++;
+//					memset(silence_tx_pkt->body, 0x00, c.chunk_bytes);
+					char silence[] = {0x69, 0x69, 0x05, 0xff, 0x69, 0x69, 0x05, 0xff,
+									  0x69, 0x69, 0xfa, 0xff, 0x69, 0x69, 0xfa, 0xff};
+					for (int incr = 0; incr < c.chunk_bytes; incr += sizeof(silence)) {
+						memcpy(silence_tx_pkt->body + incr, silence, sizeof(silence));
+					}
+					send_packet(silence_tx_pkt);
+				}
+
+				// first chunk
+				tx_pkt->aoe.u8sub	= i++;
+				send_packet(tx_pkt);
+				P("dop/pcm: %s", c.dop == DOP ? "DoP":"PCM");
+			}
+
+			for (int last = aoe->u8sub; i < last; i++) {
+//			for (int i = 0, last = aoe->u8sub; i < last; i++) {
 				tx_pkt->aoe.u8sub	= i;
 				ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
 				if (likely(ret > 0)) {
@@ -333,14 +381,14 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 					sprintf(_buf,
 						"TARGET [" ETHER_ADDR_FMT "]\n"
 						"\n"
-						"  AoE STATUS : %s\n"
+						"  AoE STATUS : %s (%s)\n"
 						"  AoE SESSION: %6u\n"
-						"  AoE VSOUND : %s(%d) (timeout:%lu eof:%lu intr:%lu)\n",
+						"  AoE VSOUND : %s(%d) (buffer:%ldB timeout:%lu eof:%lu intr:%lu)\n",
 						ETHER_ADDR_PTR((struct ether_addr*)&eh->ether_shost),
-						Connects[ntohl(aoe->u32opt1)],
+						Connects[ntohl(aoe->u32opt1)], c.dop == PCM ? "PCM":"DoP",
 						ntohs(aoe->u16key),
 						snd_pcm_state_name(ntohl(aoe->u32opt2)), ntohl(aoe->u32opt2),
-						c.readtimeout_count, c.eof_count, c.eintr_count);
+						c.pcm.buffer_bytes, c.readtimeout_count, c.eof_count, c.eintr_count);
 					write(_fd, _buf, strlen(_buf));
 				}
 				write(_fd, rx_payload, ntohs(aoe->u16len));
@@ -437,7 +485,15 @@ int main(int arc, char **argv)
 	if (ioctl(g.sock_fd, SIOCGIFHWADDR, &ifr) == -1)
 		teardown("SIOCGIFINDEX fail");
 	memcpy(&src, &ifr.ifr_hwaddr.sa_data, 6);
-	P("HWaddr " ETHER_ADDR_FMT, ETHER_ADDR_PTR(&src));
+	P("aoecli %s [%s] HWaddr " ETHER_ADDR_FMT,
+		AOE_VERSION, g.if_name, ETHER_ADDR_PTR(&src));
+
+	/* bind */
+	memset(&g.sll, 0, sizeof(g.sll));
+	g.sll.sll_family = AF_PACKET;
+	g.sll.sll_ifindex = if_nametoindex(g.if_name);
+	if (bind(g.sock_fd, (struct sockaddr *)&g.sll, sizeof(struct sockaddr_ll)) < 0)
+		teardown("bind fail");
 
 	/* sockaddr_ll (dest) */
 	memset(&g.sll, 0, sizeof(g.sll));
@@ -492,23 +548,23 @@ int main(int arc, char **argv)
 
 						/* C_DISCOVER (Neighbor Discovery Broadcast)
 						 *	u8cmd	C_DISCOVER
-						 *	u8sub	snd_pcm_format_t format
-						 *	u32opt1	rate
-						 *	u32opt2	channels
+						 *	u8sub	not use
+						 *	u32opt1	not use
+						 *	u32opt2	not use
+						 *  payload struct vsound_pcm
 						 */
 						if (g.options & OPT_AUTO)
 							memset(&dst, 0xff, 6); // Broadcast
 
-						char * payload = "Neighbor Discovery";
-						struct aoe_packet * tx_pkt = prepare_tx_packet(&src, &dst, g.key, C_DISCOVER, (uint8_t)c.pcm.format, c.pcm.rate, c.pcm.channels, strlen(payload));
-						memcpy(tx_pkt->body, payload, strlen(payload));
+						struct aoe_packet * tx_pkt = prepare_tx_packet(&src, &dst, g.key, C_DISCOVER, 0, 0, 0, sizeof(struct vsound_pcm));
+						memcpy(tx_pkt->body, &c.pcm, sizeof(struct vsound_pcm));
 						send_packet(tx_pkt);
 
 						c.last_ts = c.cur_ts;
 						g.poll_timeout_ms = BROADCAST_MS;
-						P("send *Neighbor Discovery* SND_PCM_STATE:%s(%d) %s %u %u (avail_bytes:%ld)",
-							snd_pcm_state_name(c.pcm.state), c.pcm.state,
-							snd_pcm_format_name(c.pcm.format), c.pcm.rate, c.pcm.channels, avail_bytes);
+						P("send *Neighbor Discovery* (%s) %s %u %u (buffer:%ldB avail:%ldB)",
+							snd_pcm_state_name(c.pcm.state), snd_pcm_format_name(c.pcm.format), c.pcm.rate, c.pcm.channels,
+							c.pcm.buffer_bytes, avail_bytes);
 					}
 				} else {
 					/* clear count */
