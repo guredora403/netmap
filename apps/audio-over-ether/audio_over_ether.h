@@ -24,6 +24,9 @@
 #define HOST_TXRING_IDX0	7170
 #define AOE_LUT_INDEX		100000
 
+/* netmap idx to aoebuf idx */
+#define AOE_BUF_IDX(idx)	(idx < AOE_LUT_INDEX ? (idx - HW_RXRING_IDX0)%2048 : idx + NM_NUM_SLOTS * 2 - AOE_LUT_INDEX)
+
 /*
  * The AoE Sound Driver uses the size of the ether header
  * or aoe header to calculate the memory address.

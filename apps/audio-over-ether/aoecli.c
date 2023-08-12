@@ -15,8 +15,10 @@
 #include "vsound.h"
 #include "aoe.h"
 
-#define BROADCAST_MS	500
-#define MAX_EVENTS		10
+#define BROADCAST_MS		500
+#define MAX_EVENTS			10
+#define MAX_RETRY_COUNT		200
+#define RETRY_INTERVAL_US	1000*100
 
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
@@ -65,6 +67,7 @@ struct client_stats {
 	struct vsound_pcm pcm;
 	struct vsound_pcm session_pcm;
 	enum DoP dop;
+	bool close_reservation;
 	uint32_t last_mixer_value;
 	unsigned long readtimeout_count;
 	unsigned long eof_count;
@@ -110,7 +113,6 @@ static int read_buf(int fd, char *buf, int count, uint64_t timeout)
 				memset(buf + l, 0x00, count - l);
 				return l;
 			}
-			P("read_buf nodata (errno:%d)", errno);
 			return -ENODATA;
 		}
 	} while (l < count);
@@ -190,8 +192,10 @@ static void send_packet(struct aoe_packet * pkt)
 	int tx_len = sizeof(struct ether_header) + sizeof(struct aoe_header) + ntohs(pkt->aoe.u16len);
 	int ret;
 	ret = sendto(g.sock_fd, (void *)pkt, tx_len, 0, (struct sockaddr *)&g.sll, sizeof(struct sockaddr_ll));
-	if (ret == -1)
+	if (ret == -1) {
+		P("sendto fail!");
 		g.stat = TEARDOWN;
+	}
 }
 
 static void send_query_model(struct ether_addr *src, struct ether_addr *dst)
@@ -220,10 +224,24 @@ static void send_close(struct ether_addr *src, struct ether_addr *dst)
 
 	c.session_pcm = (struct vsound_pcm) {0};
 	c.dop = UNKNOWN;
+	c.close_reservation = false;
 	g.stat = CLOSED;
 	g.key = 0;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
 	c.last_mixer_value = 0;
+}
+
+static void set_silence(struct aoe_packet * pkt)
+{
+	if (c.dop == DOP) {
+		char silence[] = {0x69, 0x69, 0x05, 0xff, 0x69, 0x69, 0x05, 0xff,
+						  0x69, 0x69, 0xfa, 0xff, 0x69, 0x69, 0xfa, 0xff};
+		for (int incr = 0; incr < c.chunk_bytes; incr += sizeof(silence)) {
+			memcpy(pkt->body + incr, silence, sizeof(silence));
+		}
+	} else {
+		memset(pkt->body, 0x00, c.chunk_bytes);
+	}
 }
 
 static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, struct ether_addr * dst)
@@ -238,6 +256,7 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 		case C_DREQ: /* CLIENT side */
 			if (g.stat != CONNECTED || g.key != ntohs(aoe->u16key))
 				break;
+
 			int ret = 0;
 			/* Buffer read deadline */
 			unsigned int buffered_playback_us = *((unsigned int*)rx_payload);
@@ -249,59 +268,63 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			/* Since all headers are the same, prepare them only once. */
 			tx_pkt = prepare_tx_packet(src, dst, g.key, C_DRES, 0, ntohl(aoe->u32opt1), ntohl(aoe->u32opt2), c.chunk_bytes);
 
-			/* detect DoP */
+			/* pcm info modified */
+			if (c.dop != UNKNOWN && c.close_reservation) {
+				for (int last = aoe->u8sub; i < last; i++) {
+					tx_pkt->aoe.u8sub	= i;
+					set_silence(tx_pkt);
+					send_packet(tx_pkt);
+				}
+				P("recv *Data Request*, but pcm information has been modified. Send Silence and *Close*");
+				send_close(src, dst);
+				c.close_reservation = false;
+				break;
+			}
+
+			/* first time, detect DoP */
 			if (c.dop == UNKNOWN) {
 				if (c.session_pcm.format == SND_PCM_FORMAT_S24) {
 					c.dop = DOP;
 					ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
 					uint16_t * sample = (uint16_t *)tx_pkt->body + 1;
-/*
-//					P("%x %x %x %x %x %x %x %x", *(sample), *(sample + 1), *(sample + 2), *(sample + 3),
-//						*(sample + 4), *(sample + 5), *(sample + 6), *(sample + 7));
 
-					P("%x %x %x %x %x %x %x %x | %x", *(sample - 1), *(sample), *(sample + 1), *(sample + 2), *(sample + 3),
-						*(sample + 4), *(sample + 5), *(sample + 6), *(sample + 7));
+					/* dump first 16 Bytes */
 					uint8_t * s = (uint8_t *)tx_pkt->body;
 					P("%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
 						*(s), *(s+1), *(s+2), *(s+3), *(s+4), *(s+5), *(s+6), *(s+7),
 						*(s+8), *(s+9), *(s+10), *(s+11), *(s+12), *(s+13), *(s+14), *(s+15));
-*/
-					for (int idx = 0;  idx < 32; idx++) {
+
+					/* check dop marker */
+					for (int loop = 0;  loop < 32; loop++, sample += 2) {
 						if (*sample != 0xff05 && *sample != 0xfffa) {
 							c.dop = PCM;
 							break;
 						}
-						sample += 2;
 					}
+
+					if (c.dop == DOP && aoe->u8sub > 1) {
+						// silence chunk
+						struct aoe_packet * silence_tx_pkt = prepare_tx_packet(src, dst, g.key, C_DRES, 0,
+								ntohl(aoe->u32opt1), ntohl(aoe->u32opt2), c.chunk_bytes);
+						silence_tx_pkt->aoe.u8sub	= i++;
+						set_silence(silence_tx_pkt);
+						send_packet(silence_tx_pkt);
+					}
+					// and then, send first chunk
+					tx_pkt->aoe.u8sub	= i++;
+					send_packet(tx_pkt);
+
+					P("dop/pcm: %s", c.dop == DOP ? "DoP":"PCM");
 				} else {
 					c.dop = PCM;
 				}
-
-				if (c.dop == DOP && aoe->u8sub > 1) {
-					// silence chunk
-					struct aoe_packet * silence_tx_pkt = prepare_tx_packet(src, dst, g.key, C_DRES, 0,
-						ntohl(aoe->u32opt1), ntohl(aoe->u32opt2), c.chunk_bytes);
-					silence_tx_pkt->aoe.u8sub	= i++;
-//					memset(silence_tx_pkt->body, 0x00, c.chunk_bytes);
-					char silence[] = {0x69, 0x69, 0x05, 0xff, 0x69, 0x69, 0x05, 0xff,
-									  0x69, 0x69, 0xfa, 0xff, 0x69, 0x69, 0xfa, 0xff};
-					for (int incr = 0; incr < c.chunk_bytes; incr += sizeof(silence)) {
-						memcpy(silence_tx_pkt->body + incr, silence, sizeof(silence));
-					}
-					send_packet(silence_tx_pkt);
-				}
-
-				// first chunk
-				tx_pkt->aoe.u8sub	= i++;
-				send_packet(tx_pkt);
-				P("dop/pcm: %s", c.dop == DOP ? "DoP":"PCM");
 			}
 
+			bool no_data = false;
 			for (int last = aoe->u8sub; i < last; i++) {
-//			for (int i = 0, last = aoe->u8sub; i < last; i++) {
 				tx_pkt->aoe.u8sub	= i;
 				ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
-				if (likely(ret > 0)) {
+				if (ret == c.chunk_bytes) {
 					/* C_DRES (Data Response)
 					 *	u8cmd	C_DRES
 					 *	u8sub	response index of requests
@@ -309,14 +332,27 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 					 *	u32opt2	DREQ timespec nsec
 					 */
 					send_packet(tx_pkt);
-				}
-				if (unlikely(ret < c.chunk_bytes)) {
-					P("recv *Data Request*, but buffer read return %d (%d:%s), send *Close*",
-						ret, errno, strerror(errno));
-					send_close(src, dst);
-					break;
+					no_data = false;
+				} else {
+					set_silence(tx_pkt);
+					send_packet(tx_pkt);
+					no_data = true;
 				}
 			}
+			if (no_data) {
+				read_stats();
+				if (c.pcm.format != c.session_pcm.format
+				 || c.pcm.rate != c.session_pcm.rate
+				 || c.pcm.channels != c.session_pcm.channels) {
+					c.close_reservation = true;
+					P("after C_DRES, rate change detected.");
+				} else {
+					P("recv *Data Request*, but buffer read return %d (%d:%s), send *Close*",
+							ret, errno, strerror(errno));
+					send_close(src, dst);
+				}
+			}
+
 			break;
 		case C_SYN: /* CLIENT side */
 			if (g.stat != CLOSED) {
@@ -328,22 +364,26 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 				}
 				break;
 			}
+
 			/* update session pcm info */
+			c.chunk_bytes = (int)ntohl(aoe->u32opt1);
 			c.session_pcm.rate = c.pcm.rate;
 			c.session_pcm.format = c.pcm.format;
 			c.session_pcm.channels = c.pcm.channels;
-			g.stat = CONNECTED;
-			g.key = (uint16_t)ntohl(aoe->u32opt2);
-			g.poll_timeout_ms = -1;
-			c.chunk_bytes = (int)ntohl(aoe->u32opt1);
+			g.key = (uint16_t)ntohs(aoe->u16key);
 
 			P("recv *SYN* from " ETHER_ADDR_FMT ", %s->CONNECTED chunk_bytes:%d, send *ACK*",
 				ETHER_ADDR_PTR((struct ether_addr *)&eh->ether_shost),
 				Connects[g.stat], c.chunk_bytes);
 
+			g.stat = CONNECTED;
+			g.poll_timeout_ms = -1;
+
 			// update dst only
-			if (g.options & OPT_AUTO)
-				memcpy(dst, &eh->ether_shost, 6);
+			if (g.options & OPT_AUTO) {
+				memcpy(dst, &eh->ether_shost, ETH_ALEN);
+				memcpy(&g.sll.sll_addr, dst, ETH_ALEN);
+			}
 
 			if (aoe->u8sub)
 				g.options |= OPT_CSUM;
@@ -401,6 +441,8 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			P("recv *Close* %s->CLOSED", Connects[g.stat]);
 			g.stat = CLOSED;
 			g.key = 0;
+			c.dop = UNKNOWN;
+			c.close_reservation = false;
 			c.last_mixer_value = 0;
 			break;
 		case C_DRES: {	/* SERVER side */ }
@@ -424,6 +466,8 @@ int main(int arc, char **argv)
 	g.options |= OPT_AUTO;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
 	strcpy(g.if_name, "eth0");
+	c.dop = UNKNOWN;
+	c.close_reservation = false;
 
 	int ch;
 	while ((ch = getopt(arc, argv, "hvi:d:s")) != -1) {
@@ -488,12 +532,16 @@ int main(int arc, char **argv)
 	P("aoecli %s [%s] HWaddr " ETHER_ADDR_FMT,
 		AOE_VERSION, g.if_name, ETHER_ADDR_PTR(&src));
 
-	/* bind */
-	memset(&g.sll, 0, sizeof(g.sll));
-	g.sll.sll_family = AF_PACKET;
-	g.sll.sll_ifindex = if_nametoindex(g.if_name);
-	if (bind(g.sock_fd, (struct sockaddr *)&g.sll, sizeof(struct sockaddr_ll)) < 0)
-		teardown("bind fail");
+	/* wait for link up */
+	for (int retry_count = 0; retry_count < MAX_RETRY_COUNT; retry_count++) {
+		if (ioctl(g.sock_fd, SIOCGIFFLAGS, &ifr) == -1)
+			teardown("SIOCGIFFLAGS fail");
+		if (ifr.ifr_flags & IFF_RUNNING) {
+			P("[%s] link is up! (%d ms)", g.if_name, retry_count * RETRY_INTERVAL_US/1000);
+			break;
+		}
+		usleep(RETRY_INTERVAL_US);
+	}
 
 	/* sockaddr_ll (dest) */
 	memset(&g.sll, 0, sizeof(g.sll));
@@ -503,6 +551,11 @@ int main(int arc, char **argv)
 	g.sll.sll_hatype = ARPHRD_ETHER;
 	g.sll.sll_pkttype = 0;
 	g.sll.sll_halen = ETH_ALEN;
+	memcpy(&g.sll.sll_addr, &dst, ETH_ALEN);
+
+	/* bind */
+	if (bind(g.sock_fd, (struct sockaddr *)&g.sll, sizeof(struct sockaddr_ll)) < 0)
+		teardown("bind fail");
 
 	/* epoll */
 	int nfds;
@@ -530,8 +583,7 @@ int main(int arc, char **argv)
 				 c.pcm.format != c.session_pcm.format
 			  || c.pcm.rate != c.session_pcm.rate
 			  || c.pcm.channels != c.session_pcm.channels) ) {
-			P("send *Close* pcm information has been modified.");
-			send_close(&src, &dst);
+			c.close_reservation = true;
 		} else {
 			switch (c.pcm.state) {
 			case SND_PCM_STATE_PREPARED:
@@ -548,9 +600,9 @@ int main(int arc, char **argv)
 
 						/* C_DISCOVER (Neighbor Discovery Broadcast)
 						 *	u8cmd	C_DISCOVER
-						 *	u8sub	not use
-						 *	u32opt1	not use
-						 *	u32opt2	not use
+						 *	u8sub	0 (not use)
+						 *	u32opt1	0 (not use)
+						 *	u32opt2	0 (not use)
 						 *  payload struct vsound_pcm
 						 */
 						if (g.options & OPT_AUTO)
@@ -565,6 +617,8 @@ int main(int arc, char **argv)
 						P("send *Neighbor Discovery* (%s) %s %u %u (buffer:%ldB avail:%ldB)",
 							snd_pcm_state_name(c.pcm.state), snd_pcm_format_name(c.pcm.format), c.pcm.rate, c.pcm.channels,
 							c.pcm.buffer_bytes, avail_bytes);
+						P("DEBUG src:" ETHER_ADDR_FMT " dst:" ETHER_ADDR_FMT,
+							ETHER_ADDR_PTR(&src), ETHER_ADDR_PTR(&dst));
 					}
 				} else {
 					/* clear count */
@@ -592,8 +646,10 @@ int main(int arc, char **argv)
 		/* epoll wait */
 		nfds = epoll_wait(g.epoll_fd, events, MAX_EVENTS, g.poll_timeout_ms);
 		if (nfds == -1) {
-			if (errno != EINTR && g.stat != EXIT)
+			if (errno != EINTR && g.stat != EXIT) {
+				P("epoll_wait fail!");
 				g.stat = TEARDOWN;
+			}
 		} else if (nfds == 0) {
 			// timeout
 			continue;

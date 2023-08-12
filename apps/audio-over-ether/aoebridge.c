@@ -82,9 +82,10 @@ struct server_stats {
 	struct timespec last_ts;
 	struct event_count ev;
 	struct stats poll_stats;
+	unsigned long recv_total;
+	unsigned long dreq_timeout;
 #ifdef SERVER_STATS
 	struct stats trip_stats[CAP];
-	unsigned long recv_total;
 	unsigned long forward_total;
 	unsigned long poll_total;
 	unsigned long req_count;
@@ -238,8 +239,7 @@ static void signal_handler(int sig)
 
 static inline void * idx_to_bufp (unsigned long idx)
 {
-	idx = idx < AOE_LUT_INDEX ? (idx - HW_RXRING_IDX0)%2048 : idx + NM_NUM_SLOTS * 2 - AOE_LUT_INDEX;
-	return (void *)g.aoe_buf_addr + NM_BUFSZ * idx;
+	return (void *)g.aoe_buf_addr + NM_BUFSZ * AOE_BUF_IDX(idx);
 }
 
 static void swapto(int is_hwring, struct netmap_slot * rxslot)
@@ -553,10 +553,10 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				unsigned int _trip = timespec_diff_ns(aoe_ts, s.cur_ts)/1000;
 				s.trip_us_total += _trip;
 				calc_stats(&s.trip_stats[s.req-1], _trip);
-				s.recv_total += s.recv;
 				s.poll_total += s.poll_count;
 				s.req_count++;
 #endif
+				s.recv_total += s.recv;
 				reset(&s);
 			}
 			break;
@@ -564,8 +564,12 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			if (g.stat != CLOSED)
 				break;
 
+			/* new session key */
 			clock_gettime(CLOCK_MONOTONIC, &s.last_ts);
 			g.key = (uint16_t)s.last_ts.tv_nsec;
+
+			// update dst
+			memcpy(dst, &eh->ether_shost, 6);
 
 			// format/rate/channels
 			struct vsound_pcm * pcm = (struct vsound_pcm*)rx_payload;
@@ -595,21 +599,18 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			}
 
 			P("recv *Neighbor Discovery* from " ETHER_ADDR_FMT ", %s->SYN, send *SYN*",
-				ETHER_ADDR_PTR((struct ether_addr *)&eh->ether_shost), Connects[g.stat]);
+				ETHER_ADDR_PTR(dst), Connects[g.stat]);
 			g.stat = SYN;
 			g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
-
-			// update dst
-			memcpy(dst, &eh->ether_shost, 6);
 
 			/* C_SYN (Synchronize)
 			 *	u8cmd	C_SYN
 			 *	u8sub	0:checksum off 1:checksum on
 			 *	u32opt1	chunk_bytes
-			 *	u32opt2	session key
+			 *	u32opt2	0 (not use)
 			 */
 			char * payload = "Synchronize";
-			_pkt = prepare_tx_packet(src, dst, C_SYN, g.options & OPT_CSUM ? 1:0, (uint32_t)s.chunk_bytes, g.key, strlen(payload));
+			_pkt = prepare_tx_packet(src, dst, C_SYN, g.options & OPT_CSUM ? 1:0, (uint32_t)s.chunk_bytes, 0, strlen(payload));
 			memcpy(_pkt->body, payload, strlen(payload));
 			break;
 		case C_ACK: /* SERVER side */
@@ -645,10 +646,11 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				send_model_report(src, &query_host);
 				break;
 			} if (aoe->u8sub == SIGRTMIN) {
-#ifdef SERVER_STATS
 				/* reset counter (aoereset) */
-				P("recv *QUERY(%u)*, reset counter", aoe->u8sub);
 				s.recv_total	= 0;
+				s.dreq_timeout	= 0;
+#ifdef SERVER_STATS
+				P("recv *QUERY(%u)*, reset counter", aoe->u8sub);
 				s.forward_total = 0;
 				s.poll_total	= 0;
 				s.req_count	= 0;
@@ -686,11 +688,11 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				/* show server status (lsaoe) */
 				sprintf(report,
 					"  PCM PARAM  : %s %u %u chunk_bytes:%d period_us:%u\n"
-					"  AoE STATS  : dreq=%d recv=%d (received AoE packets:%lu)\n"
+					"  AoE STATS  : dreq=%d recv=%d (dreq timeout:%lu received AoE packets:%lu)\n"
 					"  DMA STATS  : %s (cb_frames:%d)\n"
 					"  SOUND CARD : %s\n",
 					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels, s.chunk_bytes, s.pcm.period_us,
-					s.dreq_limits, s.recv_limits, s.recv_total,
+					s.dreq_limits, s.recv_limits, s.dreq_timeout, s.recv_total,
 					ext->stat == ACTIVE ? "ACTIVE":"INACTIVE", s.cb_frames,
 					g.model.name);
 #ifdef CSUM
@@ -741,7 +743,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			P("recv *Close* %s->CLOSED", Connects[g.stat]);
 			g.stat = CLOSED;
 			g.key = 0;
-			reset(&s);
+//			reset(&s);
 			break;
 		case C_DREQ: /* CLIENT side */
 		case C_SYN: /* CLIENT side */
@@ -822,7 +824,8 @@ int main(int arc, char **argv)
 	/* ext_slot */
 	ext = (struct ext_slot *)((void *)g.aoe_buf_addr + AOE_BUF_SIZE + NM_BUFSZ * AOE_NUM_SLOTS);
 	ext->num_slots = s.cb_frames * 4;
-	ext->tail = s.req = 0;
+	s.req = 0;
+	ext->tail = 0;
 	__atomic_store_n(&ext->head, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&ext->cur, 0, __ATOMIC_RELEASE);
 
@@ -918,6 +921,7 @@ int main(int arc, char **argv)
 					if (ext->stat == INACTIVE) {
 						reset(&s);
 						send_close(&src, &dst);
+						s.dreq_timeout++;
 						P("send *Close* There is no response to the data request, and DMA has also stopped.");
 					}
 				}
@@ -927,7 +931,8 @@ int main(int arc, char **argv)
 		// If DMA is inactive, call snd_pcm_start using ioctl.
 		if (ext->stat == INACTIVE) {
 			const int ext_playable = ext->head >= ext->cur ? (ext->head - ext->cur):(ext->num_slots + ext->head - ext->cur);
-			if (ext_playable >= ext->num_slots/2) {
+//			if (ext_playable >= ext->num_slots/2) {
+			if (ext_playable >= (s.cb_frames - 1)*2) {
 				if (ioctl(g.aoe_buf_fd, IOCTL_PCM_START)) {
 					P("ioctl error!");
 				} else {
@@ -983,6 +988,7 @@ int main(int arc, char **argv)
 			if (s.recv) {
 				__atomic_store_n(&ext->head,
 					(ext->head + s.recv > ext->num_slots -1 ? ext->head + s.recv - ext->num_slots:ext->head+s.recv), __ATOMIC_RELEASE);
+				P("CLOSED ext->head update (recv:%d)", s.recv);
 			}
 			reset(&s);
 			break;
