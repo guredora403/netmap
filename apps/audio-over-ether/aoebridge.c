@@ -76,6 +76,8 @@ struct server_stats {
 	int dreq_limits;
 	int recv_limits;
 	int last_volume_value;
+	int client_mtu;
+	int server_mtu;
 	struct vsound_pcm pcm;
 	struct netmap_slot * cur_slot;
 	struct timespec cur_ts;
@@ -303,7 +305,14 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 
 	const size_t bytes_per_sample = snd_pcm_format_physical_width(format)/8;
 
-	ssize_t packet_buffer_bytes = MTU_ETH - sizeof(struct aoe_header);
+	/* Adjust to the minimum MTU. */
+	int target_mtu = MTU_ETH;
+	if (target_mtu > s.client_mtu)
+		target_mtu = s.client_mtu;
+	if (target_mtu > s.server_mtu)
+		target_mtu = s.server_mtu;
+
+	ssize_t packet_buffer_bytes = target_mtu - sizeof(struct aoe_header);
 
 	/* Consider the case where the buffer size of vsound is smaller than (MTU - AoE header). */
 	if (buffer_bytes < packet_buffer_bytes) {
@@ -568,6 +577,9 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			clock_gettime(CLOCK_MONOTONIC, &s.last_ts);
 			g.key = (uint16_t)s.last_ts.tv_nsec;
 
+			// mtu
+			s.client_mtu = ntohl(aoe->u32opt1);
+
 			// update dst
 			memcpy(dst, &eh->ether_shost, 6);
 
@@ -646,10 +658,8 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				send_model_report(src, &query_host);
 				break;
 			} if (aoe->u8sub == SIGRTMIN) {
-				/* reset counter (aoereset) */
-				s.recv_total	= 0;
-				s.dreq_timeout	= 0;
 #ifdef SERVER_STATS
+				/* reset counter (aoereset) */
 				P("recv *QUERY(%u)*, reset counter", aoe->u8sub);
 				s.forward_total = 0;
 				s.poll_total	= 0;
@@ -660,6 +670,8 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				s.poll_stats = (struct stats){ 0 };
 				s.poll_stats.min = ULONG_MAX;
 #endif
+				s.recv_total	= 0;
+				s.dreq_timeout	= 0;
 				break;
 			} else if (aoe->u8sub >= SIGRTMAX-14){
 				int cmd_arg = 0;
@@ -743,7 +755,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			P("recv *Close* %s->CLOSED", Connects[g.stat]);
 			g.stat = CLOSED;
 			g.key = 0;
-//			reset(&s);
+			reset(&s);
 			break;
 		case C_DREQ: /* CLIENT side */
 		case C_SYN: /* CLIENT side */
@@ -763,6 +775,8 @@ int main(int arc, char **argv)
 {
 	struct ether_addr src, dst;
 	s = (struct server_stats){ 0 };
+	s.client_mtu = MTU_ETH;
+	s.server_mtu = MTU_ETH;
 #ifdef SERVER_STATS
 	s.poll_stats = (struct stats){ 0 };
 	s.poll_stats.min = ULONG_MAX;
@@ -824,8 +838,7 @@ int main(int arc, char **argv)
 	/* ext_slot */
 	ext = (struct ext_slot *)((void *)g.aoe_buf_addr + AOE_BUF_SIZE + NM_BUFSZ * AOE_NUM_SLOTS);
 	ext->num_slots = s.cb_frames * 4;
-	s.req = 0;
-	ext->tail = 0;
+	ext->tail = s.req = 0;
 	__atomic_store_n(&ext->head, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&ext->cur, 0, __ATOMIC_RELEASE);
 
@@ -839,11 +852,16 @@ int main(int arc, char **argv)
 	if (sock_fd == -1)
 		teardown("socket open error");
 	if (ioctl(sock_fd, SIOCGIFHWADDR, &ifr) == -1)
-		teardown("SIOCGIFINDEX fail");
+		teardown("SIOCGIFHWADDR fail");
 	memcpy(&src, &ifr.ifr_hwaddr.sa_data, 6);
-	close(sock_fd);
 	P("aoebridge %s [%s] HWaddr " ETHER_ADDR_FMT,
 		AOE_VERSION, g.if_name, ETHER_ADDR_PTR(&src));
+
+	/* MTU */
+	if (ioctl(sock_fd, SIOCGIFMTU, &ifr) == -1)
+		teardown("SIOCGIFMTU fail");
+	s.server_mtu = ifr.ifr_mtu;
+	close(sock_fd);
 
 	/* nmport */
 	char netmapif[100];
@@ -919,10 +937,10 @@ int main(int arc, char **argv)
 				/* data request timeout */
 				if (unlikely(timespec_diff_ns(s.last_ts, s.cur_ts) > s.pcm.period_us * ext->num_slots * 1000)) {
 					if (ext->stat == INACTIVE) {
+						P("send *Close* There is no response to the data request, and DMA has also stopped.");
 						reset(&s);
 						send_close(&src, &dst);
 						s.dreq_timeout++;
-						P("send *Close* There is no response to the data request, and DMA has also stopped.");
 					}
 				}
 			}
@@ -931,8 +949,7 @@ int main(int arc, char **argv)
 		// If DMA is inactive, call snd_pcm_start using ioctl.
 		if (ext->stat == INACTIVE) {
 			const int ext_playable = ext->head >= ext->cur ? (ext->head - ext->cur):(ext->num_slots + ext->head - ext->cur);
-//			if (ext_playable >= ext->num_slots/2) {
-			if (ext_playable >= (s.cb_frames - 1)*2) {
+			if (ext_playable >= ext->num_slots/2) {
 				if (ioctl(g.aoe_buf_fd, IOCTL_PCM_START)) {
 					P("ioctl error!");
 				} else {
@@ -978,10 +995,10 @@ int main(int arc, char **argv)
 		switch (g.stat) {
 		case SYN:/* SYN timeout */
 			if (timespec_diff_ns(s.last_ts, s.cur_ts) > SYN_TIMEOUT_MS * 1000000) {
+				P("SYN TIMEOUT!, send *CLOSE*");
 				send_close(&src, &dst);
 				g.stat = CLOSED;
 				g.key = 0;
-				P("SYN TIMEOUT!, send *CLOSE*");
 			}
 			break;
 		case CLOSED:
