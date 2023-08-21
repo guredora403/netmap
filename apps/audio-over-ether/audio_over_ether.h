@@ -24,7 +24,15 @@
 #define HOST_TXRING_IDX0	7170
 #define AOE_LUT_INDEX		100000
 
-/* netmap idx to aoebuf idx */
+/* netmap buf idx to aoebuf idx macro
+ *  netmap    aoebuf
+ *       2 ->      0 [HW_RXRING_IDX0]
+ *    1025 ->   1023
+ *    7170 ->   1024 [HOST_TXRING_IDX0]
+ *    8193 ->   2047
+ *   10000 ->   2048 [AOE_LUT_INDEX]
+ *   11023 ->   3071
+ */
 #define AOE_BUF_IDX(idx)	(idx < AOE_LUT_INDEX ? (idx - HW_RXRING_IDX0)%2048 : idx + NM_NUM_SLOTS * 2 - AOE_LUT_INDEX)
 
 /*

@@ -904,22 +904,26 @@ generic_rx_handler(if_t ifp, struct mbuf *m)
 #ifdef CONFIG_SMPD_OPTION_AOE
 	mbq_safe_enqueue(&kring->rx_queue, m);
 	/* When there are packets awaiting arrival, wait until the queue accumulates packets. */
-	if (0 == ext->unarrived_dreq_packets) {
-		netmap_generic_irq(na, r, &work_done);
-	} else if (ext->unarrived_dreq_packets <= mbq_len(&kring->rx_queue)) {
-		/* Cancel the started hrtimer. */
-		if (nm_os_mitigation_active(&gna->mit[r])) {
-			gna->mit[r].mit_pending = 0;
-			nm_os_mitigation_cleanup(&gna->mit[r]);
+	{
+		int _unarrived_dreq_packets;
+		_unarrived_dreq_packets = READ_ONCE(ext->unarrived_dreq_packets);
+		if (0 == _unarrived_dreq_packets) {
+			netmap_generic_irq(na, r, &work_done);
+		} else if (_unarrived_dreq_packets <= mbq_len(&kring->rx_queue)) {
+			/* Cancel the started hrtimer. */
+			if (nm_os_mitigation_active(&gna->mit[r])) {
+				gna->mit[r].mit_pending = 0;
+				nm_os_mitigation_cleanup(&gna->mit[r]);
+			}
+			/* If the queue has a scheduled amount of packets arriving, notify immediately. */
+			netmap_generic_irq(na, r, &work_done);
+		} else if (nm_os_mitigation_active(&gna->mit[r])) {
+			/* If the hrtimer has already been started, Record that there is some pending work. */
+			gna->mit[r].mit_pending = 1;
+		} else {
+			/* Start the hrtimer. */
+			nm_os_mitigation_start(&gna->mit[r]);
 		}
-		/* If the queue has a scheduled amount of packets arriving, notify immediately. */
-		netmap_generic_irq(na, r, &work_done);
-	} else if (nm_os_mitigation_active(&gna->mit[r])) {
-		/* If the hrtimer has already been started, Record that there is some pending work. */
-		gna->mit[r].mit_pending = 1;
-	} else {
-		/* Start the hrtimer. */
-		nm_os_mitigation_start(&gna->mit[r]);
 	}
 #else
 	if (kring->nr_mode == NKR_NETMAP_OFF) {

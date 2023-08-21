@@ -70,11 +70,12 @@ struct client_stats {
 	unsigned long readtimeout_count;
 	unsigned long eof_count;
 	unsigned long eintr_count;
+	unsigned long outgoing_count;
 	struct timespec model_req_ts;
 };
 static struct client_stats c;
 
-#define READ_SLEEP_US	1000 * 10
+#define READ_SLEEP_US	(1000000 * 10 / c.pcm.rate)
 static int read_stats(void)
 {
 	return read(g.read_fd, &c.pcm, 0);
@@ -252,6 +253,15 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			for (int i = 0, last = aoe->u8sub; i < last; i++) {
 				tx_pkt->aoe.u8sub	= i;
 				ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
+
+				/* dump first 16 Bytes */
+				if (i == 0 && c.last_mixer_value != c.pcm.mixer_value) {
+					uint8_t * s = (uint8_t *)tx_pkt->body;
+					P("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+						*(s), *(s+1), *(s+2), *(s+3), *(s+4), *(s+5), *(s+6), *(s+7),
+						*(s+8), *(s+9), *(s+10), *(s+11), *(s+12), *(s+13), *(s+14), *(s+15));
+				}
+
 				if (likely(ret > 0)) {
 					/* C_DRES (Data Response)
 					 *	u8cmd	C_DRES
@@ -262,8 +272,8 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 					send_packet(tx_pkt);
 				}
 				if (unlikely(ret < c.chunk_bytes)) {
-					P("recv *Data Request*, but buffer read return %d (%d:%s), send *Close*",
-						ret, errno, strerror(errno));
+					P("recv *Data Request*, but no data available (%d:%s), send *Close*",
+						errno, strerror(errno));
 					send_close(src, dst);
 					break;
 				}
@@ -296,7 +306,7 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			// update dst only
 			if (g.options & OPT_AUTO) {
 				memcpy(dst, &eh->ether_shost, ETH_ALEN);
-				memcpy(&g.sll.sll_addr, dst, ETH_ALEN);
+				memcpy(g.sll.sll_addr, dst, ETH_ALEN);
 			}
 			if (aoe->u8sub)
 				g.options |= OPT_CSUM;
@@ -320,11 +330,13 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 				struct ether_addr _tmp;
 				memcpy(&_tmp, &eh->ether_shost, 6);
 				if (g.options & OPT_AUTO || memcmp(&_tmp, dst, 6) == 0) {
+					memcpy(dst, &_tmp, ETH_ALEN);
+					memcpy(g.sll.sll_addr, dst, ETH_ALEN);
 					struct vsound_model * model = (struct vsound_model*)rx_payload;
 					ioctl(g.read_fd, IOCTL_VSOUND_APPLY_MODEL, model);
 					P("Apply the model spec (name:%s)", model->name);
 				}
-				c.model_req_ts.tv_sec = 0;
+				c.model_req_ts.tv_sec = 0; // complete
 				break;
 			}
 
@@ -337,12 +349,12 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 						"\n"
 						"  AoE STATUS : %s\n"
 						"  AoE SESSION: %6u\n"
-						"  AoE VSOUND : %s(%d) (buffer:%ldB timeout:%lu eof:%lu intr:%lu)\n",
+						"  AoE VSOUND : %s(%d) (buffer:%ldB timeout:%lu eof:%lu intr:%lu outgo:%lu)\n",
 						ETHER_ADDR_PTR((struct ether_addr*)&eh->ether_shost),
 						Connects[ntohl(aoe->u32opt1)],
 						ntohs(aoe->u16key),
-						snd_pcm_state_name(ntohl(aoe->u32opt2)), ntohl(aoe->u32opt2),
-						c.pcm.buffer_bytes, c.readtimeout_count, c.eof_count, c.eintr_count);
+						snd_pcm_state_name(c.pcm.state), c.pcm.state,
+						c.pcm.buffer_bytes, c.readtimeout_count, c.eof_count, c.eintr_count, c.outgoing_count);
 					write(_fd, _buf, strlen(_buf));
 				}
 				write(_fd, rx_payload, ntohs(aoe->u16len));
@@ -441,6 +453,7 @@ int main(int arc, char **argv)
 	memcpy(&src, &ifr.ifr_hwaddr.sa_data, 6);
 	P("aoecli %s [%s] HWaddr " ETHER_ADDR_FMT,
 		AOE_VERSION, g.if_name, ETHER_ADDR_PTR(&src));
+	P("Destination MAC address " ETHER_ADDR_FMT, ETHER_ADDR_PTR(&dst));
 
 	/* wait for link up */
 	for (int retry_count = 0; retry_count < MAX_RETRY_COUNT; retry_count++) {
@@ -465,10 +478,10 @@ int main(int arc, char **argv)
 	g.sll.sll_family = AF_PACKET;	/* allways AF_PACKET */
 	g.sll.sll_protocol = htons(ETHERTYPE_LE2);
 	g.sll.sll_ifindex = if_nametoindex(g.if_name);
-	g.sll.sll_hatype = ARPHRD_ETHER;
+	g.sll.sll_hatype = 0;
 	g.sll.sll_pkttype = 0;
 	g.sll.sll_halen = ETH_ALEN;
-	memcpy(&g.sll.sll_addr, &dst, ETH_ALEN);
+	memcpy(g.sll.sll_addr, &dst, ETH_ALEN);
 
 	/* bind */
 	if (bind(g.sock_fd, (struct sockaddr *)&g.sll, sizeof(struct sockaddr_ll)) < 0)
@@ -510,7 +523,8 @@ int main(int arc, char **argv)
 			send_close(&src, &dst);
 		} else {
 			switch (c.pcm.state) {
-			case SND_PCM_STATE_PREPARED:
+//			case SND_PCM_STATE_PREPARED:
+			case SND_PCM_STATE_DRAINING:
 			case SND_PCM_STATE_RUNNING:
 				if (g.stat == CLOSED && avail_bytes > 0) {
 					if (timespec_diff_ns(c.last_ts, c.cur_ts) > BROADCAST_MS * 1000000) {
@@ -577,7 +591,15 @@ int main(int arc, char **argv)
 			// unbox
 			for (int i = 0; i < nfds; ++i) {
 				if (events[i].data.fd == g.sock_fd) {
-					recv(g.sock_fd, rx_buf, PACKET_BUFFER_SIZE, 0);
+					socklen_t rll_size;
+					struct sockaddr_ll rll;
+					memset(&rll, 0, sizeof(rll));
+					rll_size = sizeof(rll);
+					recvfrom(g.sock_fd, rx_buf, PACKET_BUFFER_SIZE, 0, (struct sockaddr *)&rll, &rll_size);
+					if (rll.sll_pkttype == PACKET_OUTGOING) {
+						c.outgoing_count++;
+					}
+//					recv(g.sock_fd, rx_buf, PACKET_BUFFER_SIZE, 0);
 					unbox((struct aoe_packet *)rx_buf, &src, &dst);
 				}
 			}
@@ -591,20 +613,21 @@ int main(int arc, char **argv)
 			 *	u32opt2	0 (not use)
 			 */
 			struct ether_addr dummy_host = {0};
+			memcpy(&dummy_host, &dst, 6);
 			if (c.sig == SIGMIXERCHG) {
-				memcpy(&dummy_host, &dst, 6);
 				struct vsound_control before = get_vsound_control(&c.last_mixer_value);
 				struct vsound_control after = get_vsound_control(&c.pcm.mixer_value);
 				P("send *Query* Mixer Change: volume:%d -> %d (%06x)",
 					before.volume, after.volume, c.pcm.mixer_value);
 				c.last_mixer_value = c.pcm.mixer_value;
-			} else if (g.options & OPT_AUTO || c.sig == SIGUSR1) {	/* show server status (lsaoe) */
+			} else if (c.sig == SIGUSR1) {	/* show server status (lsaoe), always broadcast */
 				memset(&dummy_host, 0xff, 6);
 			}
 			char * payload = "Query";
 			struct aoe_packet *tx_pkt = prepare_tx_packet(&src, &dummy_host, g.key, C_QUERY, c.sig, c.pcm.mixer_value, 0, strlen(payload));
 			memcpy(tx_pkt->body, payload, strlen(payload));
 			send_packet(tx_pkt);
+			P("send *Query* (sig:%d)", c.sig);
 			c.sig = 0;
 		}
 		switch (g.stat) {

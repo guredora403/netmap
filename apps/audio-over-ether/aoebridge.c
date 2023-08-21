@@ -53,6 +53,7 @@ struct globals {
 	snd_pcm_t *handle;
 	char if_name[MAX_IFNAMELEN];
 	char pcm_name[MAX_ARGLEN];
+	char ip_addr[INET_ADDRSTRLEN];
 	struct vsound_model model;
 };
 static struct globals g;
@@ -105,7 +106,7 @@ static void reset(struct server_stats *_s)
 #endif
 	_s->req = 0;
 	_s->recv = 0;
-	ext->unarrived_dreq_packets = 0;
+	__atomic_store_n(&ext->unarrived_dreq_packets, 0, __ATOMIC_RELEASE);
 }
 #ifdef SERVER_STATS
 static void calc_stats(struct stats *t, unsigned long trip)
@@ -137,7 +138,7 @@ static void __attribute__ ((noinline)) teardown(char *msg)
 	}
 
 	if (g.aoe_buf_addr) {
-		ext->unarrived_dreq_packets = 0;
+		__atomic_store_n(&ext->unarrived_dreq_packets, 0, __ATOMIC_RELEASE);
 		munmap(g.aoe_buf_addr, AOE_BUF_SIZE * 2);
 		P("teardown ... aoe buffer unmaped.");
 	}
@@ -498,7 +499,7 @@ static void send_model_report(struct ether_addr *src, struct ether_addr *dst)
 	 *	u8cmd	C_REPORT
 	 *	u8sub	sig
 	 *	u32opt1	AoE Status
-	 *	u32opt2	SND_PCM_STATUS
+	 *	u32opt2	0 (not use)
 	 */
 	struct aoe_packet * _pkt = prepare_tx_packet(src, dst, C_REPORT, MODEL_SPEC, 0, 0, sizeof(struct vsound_model));
 	memcpy(_pkt->body, &g.model, sizeof(struct vsound_model));
@@ -595,7 +596,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				|| s.pcm.buffer_bytes != _buffer_bytes) {
 
 				// When changing rates, wait until playback is complete.
-				while (ext->stat == ACTIVE)
+				while (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == ACTIVE)
 					usleep(1000 * 10);
 
 				__atomic_store_n(&ext->head, 0, __ATOMIC_RELEASE);
@@ -687,20 +688,26 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				char cmd[100];
 				sprintf(cmd, "%s %d %d ", REMOTE_COMMAND, aoe->u8sub, cmd_arg);
 				system(cmd);
+
+				/* aoesshon */
+				if (aoe->u8sub == SIGRTMAX-14){
+					_pkt = prepare_tx_packet(src, &query_host, C_REPORT, aoe->u8sub, 0, 0, strlen(g.ip_addr));
+					memcpy(_pkt->body, g.ip_addr, strlen(g.ip_addr));
+				}
 				break;
 			}
 			/* C_REPORT (Report)
 			 *	u8cmd	C_REPORT
 			 *	u8sub	sig
 			 *	u32opt1	AoE Status
-			 *	u32opt2	SND_PCM_STATUS
+			 *	u32opt2	0 (not use)
 			 */
 			memset(report, '\0', sizeof(report));
 			if (aoe->u8sub == SIGUSR1) {
 				/* show server status (lsaoe) */
 				sprintf(report,
 					"  PCM PARAM  : %s %u %u chunk_bytes:%d period_us:%u\n"
-					"  AoE STATS  : dreq=%d recv=%d (dreq timeout:%lu received AoE packets:%lu)\n"
+					"  AoE STATS  : dreq=%d recv=%d (dreq timeout:%lu total packets:%lu)\n"
 					"  DMA STATS  : %s (cb_frames:%d)\n"
 					"  SOUND CARD : %s\n",
 					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels, s.chunk_bytes, s.pcm.period_us,
@@ -746,7 +753,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 #endif
 			}
 			P("recv *QUERY(%u)*, send *REPORT* (%luB)", aoe->u8sub, strlen(report));
-			_pkt = prepare_tx_packet(src, &query_host, C_REPORT, aoe->u8sub, g.stat, s.pcm.state, strlen(report));
+			_pkt = prepare_tx_packet(src, &query_host, C_REPORT, aoe->u8sub, g.stat, 0, strlen(report));
 			memcpy(_pkt->body, report, strlen(report));
 			break;
 		case C_CLOSE:
@@ -863,6 +870,20 @@ int main(int arc, char **argv)
 	s.server_mtu = ifr.ifr_mtu;
 	close(sock_fd);
 
+	/* ip addr for report*/
+	struct sockaddr_in dst_addr = {0};
+	struct sockaddr_in src_addr = {0};
+	socklen_t addr_len = sizeof(struct sockaddr_in);
+	sock_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	dst_addr.sin_family = AF_INET;
+	dst_addr.sin_port = htons(7);
+	inet_aton("128.0.0.0", &dst_addr.sin_addr);
+	connect(sock_fd,(struct sockaddr *)&dst_addr,sizeof(dst_addr));
+	getsockname(sock_fd, (struct sockaddr *)&src_addr, &addr_len);
+	inet_ntop(AF_INET, &src_addr.sin_addr, g.ip_addr, INET_ADDRSTRLEN);
+	P("ip addr: %s", g.ip_addr);
+	close(sock_fd);
+
 	/* nmport */
 	char netmapif[100];
 	snprintf(netmapif, sizeof(netmapif), "netmap:%s*", g.if_name);
@@ -918,7 +939,8 @@ int main(int arc, char **argv)
 					 */
 					s.req = space < s.dreq_limits ? space:s.dreq_limits;
 					s.last_ts = s.cur_ts;
-					ext->unarrived_dreq_packets = s.req < s.recv_limits ? s.req:s.recv_limits ;
+					__atomic_store_n(&ext->unarrived_dreq_packets,
+						s.req < s.recv_limits ? s.req:s.recv_limits, __ATOMIC_RELEASE);
 					/* Calculate the playable time from the buffered slots and include it in the payload. */
 					unsigned int buffered_playback_us = avail * s.pcm.period_us;
 					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, sizeof(buffered_playback_us));
@@ -936,7 +958,7 @@ int main(int arc, char **argv)
 			} else {
 				/* data request timeout */
 				if (unlikely(timespec_diff_ns(s.last_ts, s.cur_ts) > s.pcm.period_us * ext->num_slots * 1000)) {
-					if (ext->stat == INACTIVE) {
+					if (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == INACTIVE) {
 						P("send *Close* There is no response to the data request, and DMA has also stopped.");
 						reset(&s);
 						send_close(&src, &dst);
@@ -947,8 +969,9 @@ int main(int arc, char **argv)
 		}
 
 		// If DMA is inactive, call snd_pcm_start using ioctl.
-		if (ext->stat == INACTIVE) {
-			const int ext_playable = ext->head >= ext->cur ? (ext->head - ext->cur):(ext->num_slots + ext->head - ext->cur);
+		if (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == INACTIVE) {
+			int _cur = __atomic_load_n(&ext->cur, __ATOMIC_ACQUIRE);
+			const int ext_playable = ext->head >= _cur ? (ext->head - _cur):(ext->num_slots + ext->head - _cur);
 			if (ext_playable >= ext->num_slots/2) {
 				if (ioctl(g.aoe_buf_fd, IOCTL_PCM_START)) {
 					P("ioctl error!");
