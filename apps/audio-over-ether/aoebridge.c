@@ -568,6 +568,9 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 #endif
 				s.recv_total += s.recv;
 				reset(&s);
+			} else {
+				/* Update the number of undelivered packets. */
+				__atomic_store_n(&ext->unarrived_dreq_packets, s.req - s.recv, __ATOMIC_RELEASE);
 			}
 			break;
 		case C_DISCOVER: /* SERVER side */
@@ -959,7 +962,7 @@ int main(int arc, char **argv)
 				/* data request timeout */
 				if (unlikely(timespec_diff_ns(s.last_ts, s.cur_ts) > s.pcm.period_us * ext->num_slots * 1000)) {
 					if (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == INACTIVE) {
-						P("send *Close* There is no response to the data request, and DMA has also stopped.");
+						P("send *Close* There is no response to the data request, and DMA has also stopped. (recv:%d)", s.recv);
 						reset(&s);
 						send_close(&src, &dst);
 						s.dreq_timeout++;
