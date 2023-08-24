@@ -1,7 +1,7 @@
 #settings
 CC=clang
 LD=ld.lld
-VERSION = 1.0RC4
+VERSION = 1.0RC5
 SRCDIR ?= ../..
 VSOUND_HEADER_DIR = $(SRCDIR)/../vsound
 BUILDDIR = $(SRCDIR)

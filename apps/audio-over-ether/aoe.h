@@ -1,6 +1,6 @@
 #define BILLION				1000000000
 #define MAX_IFNAMELEN		64	/* our buffer for ifname */
-#define DEFAULT_TIMEOUT_MS	50
+#define DEFAULT_TIMEOUT_MS	55
 #define TIMEOUT_LIMITS		20
 
 /* Query sub command */
