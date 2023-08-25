@@ -249,8 +249,14 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			/* Check if it's a retry or not. */
 			uint32_t _opt1 =ntohl(aoe->u32opt1);
 			uint32_t _opt2 =ntohl(aoe->u32opt2);
+#ifdef PACKET_LOSS_EMULATION
+			if (rand() % 1000 == 0) {
+				P("packet loss emulation *dreq loss* (opt1:%u opt2:%u)", _opt1, _opt2);
+				break;
+			}
+#endif
 			if (_opt1 == c.last_dreq_opt1 && _opt2 == c.last_dreq_opt2) {
-				P("recv retry request!");
+				P("recv retry request! (opt1:%u opt2:%u)", _opt1, _opt2);
 				goto RETRY_REQUEST;
 			}
 
@@ -284,6 +290,13 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 			}
 RETRY_REQUEST:
 			for (int i = 0, last = aoe->u8sub; i < last; i++) {
+#ifdef PACKET_LOSS_EMULATION
+				if (rand() % 1000 == 999 && rand() % last == i) {
+					P("packet loss emulation *recv loss* (opt1:%u opt2:%u)", _opt1, _opt2);
+					continue;
+				}
+#endif
+
 				send_packet((struct aoe_packet *)pkt_array[i]);
 			}
 
@@ -403,6 +416,9 @@ RETRY_REQUEST:
 
 int main(int arc, char **argv)
 {
+#ifdef PACKET_LOSS_EMULATION
+	srand(time(NULL));
+#endif
 	struct ifreq ifr;
 	struct ether_addr src, dst;
 	g = (struct globals){ 0 };

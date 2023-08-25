@@ -7,9 +7,14 @@
 #define SIGMIXERCHG	90	/* signal number for extra command (hardware volume control) */
 #define MODEL_SPEC	0	/* Model Spec Request */
 
+/* timespec util */
 #define timespec_diff_ns(from, to)	(BILLION * (to.tv_sec - from.tv_sec) + to.tv_nsec - from.tv_nsec)
 #define timespec_to_ns(ts)	(uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec
 
+/* util */
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+/* AoE Status */
 enum Status	{CONNECTED, CLOSED, SYN, TEARDOWN, EXIT};
 #if defined(LOG) || defined(CLI)
 static const char Connects[5][10] = {

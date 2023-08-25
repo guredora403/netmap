@@ -79,6 +79,7 @@ struct server_stats {
 	int last_volume_value;
 	int client_mtu;
 	int server_mtu;
+	bool pcm_started;
 	struct vsound_pcm pcm;
 	struct netmap_slot * cur_slot;
 	struct timespec cur_ts;
@@ -668,6 +669,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				break;
 			P("recv *ACK*   %s->CONNECTED", Connects[g.stat]);
 			g.stat = CONNECTED;
+			s.pcm_started = false;
 #ifdef SERVER_STATS
 			s.poll_count = 0;
 #endif
@@ -822,6 +824,7 @@ int main(int arc, char **argv)
 	s = (struct server_stats){ 0 };
 	s.client_mtu = MTU_ETH;
 	s.server_mtu = MTU_ETH;
+	s.pcm_started = false;
 #ifdef SERVER_STATS
 	s.poll_stats = (struct stats){ 0 };
 	s.poll_stats.min = ULONG_MAX;
@@ -958,6 +961,8 @@ int main(int arc, char **argv)
 	pollfd[0].fd = g.nmd->fd;
 	pollfd[0].events = POLLIN;
 
+	uint64_t next_retry_ns = 0;
+
 	while (1) {
 		if (likely(g.stat == CONNECTED)) {
 			/* buffer control */
@@ -1006,23 +1011,35 @@ int main(int arc, char **argv)
 				/* retry */
 				enum DMAStatus _stat = __atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE);
 
-//				if (_stat == ACTIVE && 0 < real_avail && real_avail < s.cb_frames) {
-				if (_stat == ACTIVE && real_avail * s.pcm.period_us < DEFAULT_TIMEOUT_MS * 1000) {
-					P("retry! avail:%d real_avail:%d req:%d recv:%d", avail, real_avail, s.req, s.recv);
-					s.dreq_retry++;
+				/* Usually, `real_avail` is maintained in a state close to full,
+				 * but if it falls below `cb_frames`,
+				 * it is considered either a packet loss or a playback stop. */
+				if (_stat == ACTIVE && 0 < real_avail && real_avail < s.cb_frames) {
+					struct timespec _ts;
+					clock_gettime(CLOCK_MONOTONIC, &_ts);
+					if (next_retry_ns < timespec_to_ns(_ts)) {
+						P("retry! avail:%d real_avail:%d req:%d recv:%d (opt1:%ld opt2:%ld)",
+							avail, real_avail, s.req, s.recv, s.last_ts.tv_sec, s.last_ts.tv_nsec);
+						s.dreq_retry++;
 
-					s.recv = 0;
-					__atomic_store_n(&ext->unarrived_dreq_packets, s.req, __ATOMIC_RELEASE);
+						s.recv = 0;
+						__atomic_store_n(&ext->unarrived_dreq_packets, s.req, __ATOMIC_RELEASE);
 
-					/* Calculate the playable time from the buffered slots and include it in the payload. */
-					unsigned int buffered_playback_us = avail * s.pcm.period_us;
-					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.last_ts.tv_sec, s.last_ts.tv_nsec, sizeof(buffered_playback_us));
-					memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
-					g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
+						/* Calculate the playable time from the buffered slots and include it in the payload. */
+						unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
+						struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.last_ts.tv_sec, s.last_ts.tv_nsec, sizeof(buffered_playback_us));
+						memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
+
+						/* Consider the timeout period to avoid repeating resend requests,
+						 * as no response can be obtained when playback is stopped.*/
+						g.poll_timeout_ms = MAX(DEFAULT_TIMEOUT_MS, buffered_playback_us/2000);
+
+						next_retry_ns = timespec_to_ns(_ts) + g.poll_timeout_ms * 1000 * 1000;
+					}
 				}
 
 				/* data request timeout */
-				if (_stat == INACTIVE && avail == 0) {
+				if (_stat == INACTIVE && avail == 0 && s.pcm_started) {
 					P("send *Close* There is no response to the data request, and DMA has stopped. (req:%d recv:%d)", s.req, s.recv);
 					reset(&s);
 					send_close(&src, &dst);
@@ -1040,6 +1057,7 @@ int main(int arc, char **argv)
 					P("ioctl error!");
 				} else {
 					P("ioctl success!(playable:%d)", ext_playable);
+					s.pcm_started = true;
 				}
 			}
 		}
@@ -1052,14 +1070,12 @@ int main(int arc, char **argv)
 			s.act_ns_total += timespec_diff_ns(s.cur_ts, _ts);
 		}
 		s.poll_count++;
+#endif
 		int poll_ret = poll(pollfd, 1, g.poll_timeout_ms);
 		clock_gettime(CLOCK_MONOTONIC, &s.cur_ts);
 		if (poll_ret == 0)
 			continue;
-#else
-		if (poll(pollfd, 1, g.poll_timeout_ms) == 0)
-			continue;
-#endif
+
 		for (i = g.nmd->first_rx_ring; i <= g.nmd->last_rx_ring; i++) {
 			is_hwring = (i != g.nmd->last_rx_ring);
 			rxring = NETMAP_RXRING(g.nmd->nifp, i);
