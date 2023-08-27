@@ -1,14 +1,12 @@
 #define NETMAP_WITH_LIBS
-#include <time.h>
-#include <limits.h>
 #include <libnetmap.h>
+#include <limits.h>
 #include <signal.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <sys/poll.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>		/* ntohs */
-#include <linux/types.h>
 #include <netinet/ether.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm.h>
@@ -18,7 +16,6 @@
 
 #define MAX_ARGLEN		64
 #define CAP				64
-#define SYN_TIMEOUT_MS	2000
 #define REMOTE_COMMAND	"/usr/local/bin/aoecmd.sh"
 
 static void usage(int errcode)
@@ -30,9 +27,6 @@ static void usage(int errcode)
 		"  -h             Show program usage and exit.\n"
 		"  -i INTERFACE   (Optional)Network interface name. (Default eth0)\n"
 		"  -D DEVICE_NAME (Optional)select PCM by name. (Default hw:0,0)\n"
-#ifdef CSUM
-		"  -s             (Optional)Enable checksums.\n"
-#endif
 		, cmd, AOE_VERSION);
 	exit(errcode);
 }
@@ -40,12 +34,11 @@ static void usage(int errcode)
 static struct ext_slot *ext;
 struct globals {
 	enum Status stat;
-	uint16_t key;
+	uint8_t key;
 	int poll_timeout_ms;
 	int options;
 #define OPT_AUTO	1
-#define OPT_FORWARD	2
-#define OPT_CSUM	4
+//#define OPT_FORWARD	2
 	char *aoe_buf_addr;
 	struct nmport_d *nmd;
 	int aoe_buf_fd;
@@ -53,7 +46,7 @@ struct globals {
 	snd_pcm_t *handle;
 	char if_name[MAX_IFNAMELEN];
 	char pcm_name[MAX_ARGLEN];
-	char ip_addr[INET_ADDRSTRLEN];
+	char ip_addr[INET_ADDRSTRLEN];	/* return for aoesshon */
 	struct vsound_model model;
 };
 static struct globals g;
@@ -69,6 +62,8 @@ struct stats {
 };
 static char report[1500];
 struct server_stats {
+	uint8_t cyclic_seq_no;
+	struct vsound_pcm pcm;
 	int chunk_bytes;
 	int cb_frames;
 	snd_pcm_uframes_t period_size;
@@ -80,7 +75,6 @@ struct server_stats {
 	int client_mtu;
 	int server_mtu;
 	bool pcm_started;
-	struct vsound_pcm pcm;
 	struct netmap_slot * cur_slot;
 	struct timespec cur_ts;
 	struct timespec last_ts;
@@ -101,13 +95,13 @@ struct server_stats {
 };
 static struct server_stats s;
 
-static void reset(struct server_stats *_s)
+static void reset(void)
 {
 #ifdef SERVER_STATS
-	_s->poll_count = 0;
+	s.poll_count = 0;
 #endif
-	_s->req = 0;
-	_s->recv = 0;
+	s.req = 0;
+	s.recv = 0;
 	__atomic_store_n(&ext->unarrived_dreq_packets, 0, __ATOMIC_RELEASE);
 }
 #ifdef SERVER_STATS
@@ -165,8 +159,8 @@ static void __attribute__ ((noinline)) teardown(char *msg)
 	}
 }
 
-static void update_packet(struct aoe_packet * pkt, struct ether_addr * src, struct ether_addr * dst,
-		enum command cmd, uint8_t sub, uint32_t opt1, uint32_t opt2, uint16_t paylen)
+static size_t update_packet(struct aoe_packet * pkt, struct ether_addr * src, struct ether_addr * dst,
+		enum command cmd, uint8_t sub, uint8_t opt, uint32_t val, size_t paylen)
 {
 	/* copy ether header */
 	struct ether_header * eh = &pkt->eh;	/* 14 bytes */
@@ -179,20 +173,16 @@ static void update_packet(struct aoe_packet * pkt, struct ether_addr * src, stru
 		memset(pkt->body + paylen, '\0', AOE_MIN_PAYLEN - paylen);
 		paylen = AOE_MIN_PAYLEN;
 	}
-	pkt->body[paylen] = '\0';
+	if (paylen < AOE_MAX_PAYLEN)
+		pkt->body[paylen] = '\0';
 
 	/* copy AoE header */
-	pkt->aoe.u16key	= htons(g.key);
+	pkt->aoe.u8key	= g.key;
 	pkt->aoe.u8cmd	= cmd;
 	pkt->aoe.u8sub	= sub;
-	pkt->aoe.u32opt1 = htonl(opt1);
-	pkt->aoe.u32opt2 = htonl(opt2);
-	pkt->aoe.u16len	= htons(paylen);
-	pkt->aoe.u16sum	= 0;
-#ifdef CSUM
-	if (unlikely(g.options & OPT_CSUM))
-		pkt->aoe.u16sum = wrapsum(checksum(pkt->body, paylen, 0));
-#endif
+	pkt->aoe.u8opt	= opt;
+	pkt->aoe.u32val = htonl(val);
+	return paylen;
 }
 
 /*
@@ -201,7 +191,7 @@ static void update_packet(struct aoe_packet * pkt, struct ether_addr * src, stru
  * Pay attention to setting the payload length at this point.
  */
 static struct aoe_packet * prepare_tx_packet(struct ether_addr * src, struct ether_addr * dst,
-		enum command cmd, uint8_t sub, uint32_t opt1, uint32_t opt2, uint16_t paylen)
+		enum command cmd, uint8_t sub, uint8_t opt, uint32_t val, size_t paylen)
 {
 	int i;
 	struct netmap_if * nifp = g.nmd->nifp;
@@ -217,10 +207,10 @@ static struct aoe_packet * prepare_tx_packet(struct ether_addr * src, struct eth
 		struct netmap_slot *slot = &txring->slot[head];
 
 		struct aoe_packet *pkt = (struct aoe_packet *)NETMAP_BUF(txring, slot->buf_idx);
-		update_packet(pkt, src, dst, cmd, sub, opt1, opt2, paylen);
+		paylen = update_packet(pkt, src, dst, cmd, sub, opt, val, paylen);
 
 		/* Please be aware that the payload length may not meet the minimum size of the Ethernet frame. */
-		int size = sizeof(struct ether_header) + sizeof(struct aoe_header) + ntohs(pkt->aoe.u16len);
+		int size = sizeof(struct ether_header) + sizeof(struct aoe_header) + paylen;
 		slot->len = size;
 		slot->flags = NS_REPORT;
 		txring->head = txring->cur = nm_ring_next(txring, head);
@@ -397,7 +387,7 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 	s.dreq_limits = s.recv_limits = req_limits;
 }
 
-static void detect_initial_params(void)
+static void spec(void)
 {
 	snd_pcm_format_t _format = SND_PCM_FORMAT_UNKNOWN;
 	unsigned int _rate = 0;
@@ -532,8 +522,8 @@ static void send_model_report(struct ether_addr *src, struct ether_addr *dst)
 	/* C_REPORT (Report)
 	 *	u8cmd	C_REPORT
 	 *	u8sub	sig
-	 *	u32opt1	AoE Status
-	 *	u32opt2	0 (not use)
+	 *	u8opt	AoE Status
+	 *	u32val	0 (not use)
 	 */
 	struct aoe_packet * _pkt = prepare_tx_packet(src, dst, C_REPORT, MODEL_SPEC, 0, 0, sizeof(struct vsound_model));
 	memcpy(_pkt->body, &g.model, sizeof(struct vsound_model));
@@ -543,8 +533,8 @@ static void send_close(struct ether_addr *src, struct ether_addr *dst)
 	/* C_CLOSE (Close)
 	 *	u8cmd	C_CLOSE
 	 *	u8sub	0 (not use)
-	 *	u32opt1	0 (not use)
-	 *	u32opt2	0 (not use)
+	 *	u8opt	0 (not use)
+	 *	u32val	0 (not use)
 	 */
 	char * payload = "Good Bye";
 	struct aoe_packet * _pkt = prepare_tx_packet(src, dst, C_CLOSE, 0, 0, 0, strlen(payload));
@@ -553,6 +543,7 @@ static void send_close(struct ether_addr *src, struct ether_addr *dst)
 	g.stat = CLOSED;
 	g.key = 0;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
+	reset();
 }
 
 static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr * dst)
@@ -565,18 +556,8 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 	if (eh->ether_type == htons(ETHERTYPE_LE2)) {
 		switch (aoe->u8cmd) {
 		case C_DRES: { /* SERVER side */ }
-			struct timespec aoe_ts = {ntohl(aoe->u32opt1), ntohl(aoe->u32opt2)};
-			if (g.stat != CONNECTED || g.key != ntohs(aoe->u16key)
-				|| s.last_ts.tv_sec != aoe_ts.tv_sec || s.last_ts.tv_nsec != aoe_ts.tv_nsec)
+			if (g.stat != CONNECTED || g.key != aoe->u8key || s.cyclic_seq_no != aoe->u8opt)
 				break;
-#if (defined SERVER_STATS && defined CSUM)
-			// checksum option
-			if (unlikely(g.options & OPT_CSUM)) {
-				uint16_t check = (aoe->u16sum != wrapsum(checksum(payload, ntohs(aoe->u16len), 0)));
-				if (check)
-					s.ev.error++;
-			}
-#endif
 			// produce
 			int _head = ext->head;
 			uint32_t target;
@@ -594,14 +575,14 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				__atomic_store_n(&ext->head,
 					(_head + s.recv > ext->num_slots -1 ? _head + s.recv - ext->num_slots:_head+s.recv), __ATOMIC_RELEASE);
 #ifdef SERVER_STATS
-				unsigned int _trip = timespec_diff_ns(aoe_ts, s.cur_ts)/1000;
+				unsigned int _trip = timespec_diff_ns(s.last_ts, s.cur_ts)/1000;
 				s.trip_us_total += _trip;
 				calc_stats(&s.trip_stats[s.req-1], _trip);
 				s.poll_total += s.poll_count;
 				s.req_count++;
 #endif
 				s.recv_total += s.recv;
-				reset(&s);
+				reset();
 			} else {
 				/* Update the number of undelivered packets. */
 				__atomic_store_n(&ext->unarrived_dreq_packets, s.req - s.recv, __ATOMIC_RELEASE);
@@ -611,12 +592,14 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			if (g.stat != CLOSED)
 				break;
 
-			/* new session key */
+			/* new session key (Do not use zero. Anything is fine, but here it's 100.) */
 			clock_gettime(CLOCK_MONOTONIC, &s.last_ts);
-			g.key = (uint16_t)s.last_ts.tv_nsec;
+			g.key = (uint8_t)s.last_ts.tv_nsec;
+			g.key = g.key == 0 ? 100:g.key;
+			P("recv *Neighbor Discovery* from " ETHER_ADDR_FMT ", send first *Data Request*", ETHER_ADDR_PTR(dst));
 
 			// mtu
-			s.client_mtu = ntohl(aoe->u32opt1);
+			s.client_mtu = ntohl(aoe->u32val);
 
 			// update dst
 			memcpy(dst, &eh->ether_shost, 6);
@@ -649,30 +632,25 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 					(s.pcm.period_us*_buffer_bytes/s.chunk_bytes)/1000);
 			}
 
-			P("recv *Neighbor Discovery* from " ETHER_ADDR_FMT ", %s->SYN, send *SYN*",
-				ETHER_ADDR_PTR(dst), Connects[g.stat]);
-			g.stat = SYN;
 			g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
-
-			/* C_SYN (Synchronize)
-			 *	u8cmd	C_SYN
-			 *	u8sub	0:checksum off 1:checksum on
-			 *	u32opt1	chunk_bytes
-			 *	u32opt2	0 (not use)
-			 */
-			char * payload = "Synchronize";
-			_pkt = prepare_tx_packet(src, dst, C_SYN, g.options & OPT_CSUM ? 1:0, (uint32_t)s.chunk_bytes, 0, strlen(payload));
-			memcpy(_pkt->body, payload, strlen(payload));
-			break;
-		case C_ACK: /* SERVER side */
-			if (g.stat != SYN || g.key != ntohs(aoe->u16key))
-				break;
-			P("recv *ACK*   %s->CONNECTED", Connects[g.stat]);
 			g.stat = CONNECTED;
 			s.pcm_started = false;
 #ifdef SERVER_STATS
 			s.poll_count = 0;
 #endif
+			/* C_DREQ (Data Request)
+			 *	u8cmd	C_DREQ
+			 *	u8sub	Number of Request Chunks
+			 *	u8opt	cyclic seq no
+			 *	u32val	chunk_bytes (first request only)
+			 */
+			s.req = s.dreq_limits;
+			s.last_ts = s.cur_ts;
+			s.cyclic_seq_no = 1;
+			__atomic_store_n(&ext->unarrived_dreq_packets, s.req, __ATOMIC_RELEASE);
+			unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
+			_pkt = prepare_tx_packet(src, dst, C_DREQ, s.req, s.cyclic_seq_no, (uint32_t)s.chunk_bytes, sizeof(buffered_playback_us));
+			memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
 			break;
 		case C_QUERY: { /* SERVER side */ }
 			// Ignore consecutive queries
@@ -685,22 +663,21 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				previous_ts = current_ts;
 			}
 
-			P("recv *QUERY* sig:%d opt1:%06x " ETHER_ADDR_FMT "->" ETHER_ADDR_FMT,
-				aoe->u8sub, ntohl(aoe->u32opt1),
+			P("recv *Query(%u)* val:%06x " ETHER_ADDR_FMT "->" ETHER_ADDR_FMT,
+				aoe->u8sub, ntohl(aoe->u32val),
 				ETHER_ADDR_PTR((struct ether_addr*)&eh->ether_shost),
 				ETHER_ADDR_PTR((struct ether_addr*)&eh->ether_dhost));
-
 			struct ether_addr query_host = {0};
 			memcpy(&query_host, &eh->ether_shost, 6);
 
 			/* Model Spec Report */
 			if (aoe->u8sub == MODEL_SPEC) {
 				send_model_report(src, &query_host);
+				P("send *Report(%d)* model spec (%luB)", MODEL_SPEC, sizeof(struct vsound_model));
 				break;
 			} if (aoe->u8sub == SIGRTMIN) {
 #ifdef SERVER_STATS
 				/* reset counter (aoereset) */
-				P("recv *QUERY(%u)*, reset counter", aoe->u8sub);
 				s.forward_total = 0;
 				s.poll_total	= 0;
 				s.req_count	= 0;
@@ -717,7 +694,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			} else if (aoe->u8sub >= SIGRTMAX-14){
 				int cmd_arg = 0;
 				if (aoe->u8sub == SIGMIXERCHG) {
-					uint32_t mixer_value = (uint32_t)ntohl(aoe->u32opt1);
+					uint32_t mixer_value = (uint32_t)ntohl(aoe->u32val);
 					struct vsound_control p = get_vsound_control(&mixer_value);
 					if (s.last_volume_value == p.volume)
 						break;
@@ -739,8 +716,8 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			/* C_REPORT (Report)
 			 *	u8cmd	C_REPORT
 			 *	u8sub	sig
-			 *	u32opt1	AoE Status
-			 *	u32opt2	0 (not use)
+			 *	u8opt	AoE Status
+			 *	u32val	0 (not use)
 			 */
 			memset(report, '\0', sizeof(report));
 			if (aoe->u8sub == SIGUSR1) {
@@ -754,14 +731,6 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 					s.dreq_limits, s.recv_limits, s.dreq_timeout, s.dreq_retry, s.recv_total,
 					ext->stat == ACTIVE ? "ACTIVE":"INACTIVE", s.cb_frames,
 					g.model.name);
-#ifdef CSUM
-				if (g.options & OPT_CSUM) {
-					char _buf[50];
-					unsigned long erate = s.ev.error > 0 ? (s.ev.error * 100)/s.stats.count:0;
-					sprintf(_buf, "  CHECKSUM   : error %lu (%lu.%02lu%%)\n", s.ev.error, erate / 100, erate % 100);
-					strcat(report, _buf);
-				}
-#endif
 				strcat(report, "\n");
 			} else if (aoe->u8sub == SIGUSR2) {
 #ifdef SERVER_STATS
@@ -792,20 +761,23 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				}
 #endif
 			}
-			P("recv *QUERY(%u)*, send *REPORT* (%luB)", aoe->u8sub, strlen(report));
+			P("send *Report(%u)* (%luB)", aoe->u8sub, strlen(report));
 			_pkt = prepare_tx_packet(src, &query_host, C_REPORT, aoe->u8sub, g.stat, 0, strlen(report));
 			memcpy(_pkt->body, report, strlen(report));
 			break;
 		case C_CLOSE:
-			if (g.stat != CONNECTED || g.key != ntohs(aoe->u16key))
+			if (g.stat != CONNECTED || g.key != aoe->u8key)
 				break;
+
+			if (memcmp(dst, &eh->ether_shost, 6) != 0)
+				break;
+
 			P("recv *Close* %s->CLOSED", Connects[g.stat]);
 			g.stat = CLOSED;
 			g.key = 0;
-			reset(&s);
+			reset();
 			break;
-		case C_DREQ: /* CLIENT side */
-		case C_SYN: /* CLIENT side */
+		case C_DREQ:	/* CLIENT side */
 		case C_REPORT:	/* CLIENT side */
 		default:
 			P("UNKNOWN COMMAND");
@@ -857,11 +829,6 @@ int main(int arc, char **argv)
 			}
 			strcpy(g.pcm_name, optarg);
 			break;
-#ifdef CSUM
-		case 's':
-			g.options |= OPT_CSUM;
-			break;
-#endif
 		}
 	}
 
@@ -871,7 +838,7 @@ int main(int arc, char **argv)
 	signal(SIGABRT, signal_handler);
 
 	/* initial pcm setup */
-	detect_initial_params();
+	spec();
 	pcm_ready();
 
 	/* open AoE buffer */
@@ -967,7 +934,6 @@ int main(int arc, char **argv)
 		if (likely(g.stat == CONNECTED)) {
 			/* buffer control */
 			int _tail = __atomic_load_n(&ext->tail, __ATOMIC_ACQUIRE);
-//			int avail = ext->head >= _tail ? (ext->head - _tail):(ext->num_slots + ext->head - _tail);
 			int _cur = __atomic_load_n(&ext->cur, __ATOMIC_ACQUIRE);
 			int avail = CIRC_CNT(ext->head, _tail, ext->num_slots);
 			int real_avail = CIRC_CNT(ext->head, _cur, ext->num_slots);
@@ -980,16 +946,17 @@ int main(int arc, char **argv)
 					/* C_DREQ (Data Request)
 					 *	u8cmd	C_DREQ
 					 *	u8sub	Number of Request Chunks
-					 *	u32opt1	DREQ timespec sec
-					 *	u32opt2	DREQ timespec nsec
+					 *	u8opt	cyclic seq no
+					 *	u32val	0 (not use)
 					 */
 					s.req = space < s.dreq_limits ? space:s.dreq_limits;
 					s.last_ts = s.cur_ts;
+					s.cyclic_seq_no++;
 					__atomic_store_n(&ext->unarrived_dreq_packets,
 						s.req < s.recv_limits ? s.req:s.recv_limits, __ATOMIC_RELEASE);
 					/* Calculate the playable time from the buffered slots and include it in the payload. */
 					unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
-					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cur_ts.tv_sec, s.cur_ts.tv_nsec, sizeof(buffered_playback_us));
+					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cyclic_seq_no, 0, sizeof(buffered_playback_us));
 					memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
 
 					/* Wake up before a buffer underrun occurs.
@@ -1018,8 +985,8 @@ int main(int arc, char **argv)
 					struct timespec _ts;
 					clock_gettime(CLOCK_MONOTONIC, &_ts);
 					if (next_retry_ns < timespec_to_ns(_ts)) {
-						P("retry! avail:%d real_avail:%d req:%d recv:%d (opt1:%ld opt2:%ld)",
-							avail, real_avail, s.req, s.recv, s.last_ts.tv_sec, s.last_ts.tv_nsec);
+						P("retry! avail:%d real_avail:%d req:%d recv:%d (opt:%u)",
+							avail, real_avail, s.req, s.recv, s.cyclic_seq_no);
 						s.dreq_retry++;
 
 						s.recv = 0;
@@ -1027,7 +994,7 @@ int main(int arc, char **argv)
 
 						/* Calculate the playable time from the buffered slots and include it in the payload. */
 						unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
-						struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.last_ts.tv_sec, s.last_ts.tv_nsec, sizeof(buffered_playback_us));
+						struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cyclic_seq_no, 0, sizeof(buffered_playback_us));
 						memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
 
 						/* Consider the timeout period to avoid repeating resend requests,
@@ -1041,14 +1008,13 @@ int main(int arc, char **argv)
 				/* data request timeout */
 				if (_stat == INACTIVE && avail == 0 && s.pcm_started) {
 					P("send *Close* There is no response to the data request, and DMA has stopped. (req:%d recv:%d)", s.req, s.recv);
-					reset(&s);
 					send_close(&src, &dst);
 					s.dreq_timeout++;
 				}
 			}
 		}
 
-		// If DMA is inactive, call snd_pcm_start using ioctl.
+		/* If DMA is inactive, call snd_pcm_start using ioctl. */
 		if (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == INACTIVE) {
 			int _cur = __atomic_load_n(&ext->cur, __ATOMIC_ACQUIRE);
 			const int ext_playable = ext->head >= _cur ? (ext->head - _cur):(ext->num_slots + ext->head - _cur);
@@ -1073,7 +1039,7 @@ int main(int arc, char **argv)
 #endif
 		int poll_ret = poll(pollfd, 1, g.poll_timeout_ms);
 		clock_gettime(CLOCK_MONOTONIC, &s.cur_ts);
-		if (poll_ret == 0)
+		if (g.stat != EXIT && g.stat != TEARDOWN && poll_ret == 0)
 			continue;
 
 		for (i = g.nmd->first_rx_ring; i <= g.nmd->last_rx_ring; i++) {
@@ -1095,21 +1061,8 @@ int main(int arc, char **argv)
 		}
 
 		switch (g.stat) {
-		case SYN:/* SYN timeout */
-			if (timespec_diff_ns(s.last_ts, s.cur_ts) > SYN_TIMEOUT_MS * 1000000) {
-				P("SYN TIMEOUT!, send *CLOSE*");
-				send_close(&src, &dst);
-				g.stat = CLOSED;
-				g.key = 0;
-			}
-			break;
 		case CLOSED:
-			if (s.recv) {
-				__atomic_store_n(&ext->head,
-					(ext->head + s.recv > ext->num_slots -1 ? ext->head + s.recv - ext->num_slots:ext->head+s.recv), __ATOMIC_RELEASE);
-				P("CLOSED ext->head update (recv:%d)", s.recv);
-			}
-			reset(&s);
+			reset();
 			break;
 		case TEARDOWN:
 			send_close(&src, &dst);

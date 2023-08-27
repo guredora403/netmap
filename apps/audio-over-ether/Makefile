@@ -1,7 +1,7 @@
 #settings
 CC=clang
 LD=ld.lld
-VERSION = 1.0RC5
+VERSION = 1.0RC6
 SRCDIR ?= ../..
 VSOUND_HEADER_DIR = $(SRCDIR)/../vsound
 BUILDDIR = $(SRCDIR)
@@ -28,9 +28,6 @@ CFLAGS += -I $(VSOUND_HEADER_DIR)
 LDLIBS += -lm -lrt -lasound
 LDFLAGS = -L./
 #LDLIBS += -lgcov
-
-# checksum
-#CFLAGS += -DCSUM
 
 # coverage (GCC)
 #CFLAGS += --coverage -O0

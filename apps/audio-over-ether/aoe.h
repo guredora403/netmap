@@ -15,16 +15,14 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* AoE Status */
-enum Status	{CONNECTED, CLOSED, SYN, TEARDOWN, EXIT};
+enum Status	{CONNECTED, CLOSED, TEARDOWN, EXIT};
 #if defined(LOG) || defined(CLI)
-static const char Connects[5][10] = {
-	"CONNECTED", "CLOSED", "SYN", "TEARDOWN", "EXIT"
+static const char Connects[4][10] = {
+	"CONNECTED", "CLOSED", "TEARDOWN", "EXIT"
 };
 #endif
 enum command{
 	C_DISCOVER,	// Neighbor Discovery Broadcast
-	C_SYN,		// Synchronize
-	C_ACK,		// Acknowledge
 	C_DREQ,		// Data Request
 	C_DRES,		// Data Response
 	C_QUERY,	// Query
@@ -68,7 +66,7 @@ static __inline uint16_t cksum_add(uint16_t sum, uint16_t a)
 	do {										\
 		struct timespec __ts;					\
 		clock_gettime(CLOCK_MONOTONIC, &__ts);	\
-		fprintf(stderr, "%06ld.%03ld %-9s [%4d] %5u| " _fmt "\n",	\
+		fprintf(stderr, "%06ld.%03ld %-8s [%4d] %3u| " _fmt "\n",	\
 		    __ts.tv_sec, __ts.tv_nsec/1000000,	\
 		    __FUNCTION__, __LINE__, g.key, ##__VA_ARGS__);	\
         } while (0)

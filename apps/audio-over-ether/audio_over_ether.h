@@ -51,16 +51,14 @@ struct ether_header
 
 #define ETHERTYPE_LE2		0x88b6	/* IEEE Std 802 - Local Experimental Ethertype 2. */
 #define MTU_ETH				1500
-#define AOE_MAX_PAYLEN		MTU_ETH - sizeof(struct ether_header) - sizeof(struct aoe_header)
-#define AOE_MIN_PAYLEN		60 - sizeof(struct ether_header) - sizeof(struct aoe_header)
+#define AOE_MAX_PAYLEN		MTU_ETH - sizeof(struct aoe_header)
+#define AOE_MIN_PAYLEN		46 - sizeof(struct aoe_header)
 struct aoe_header {
-	uint16_t u16key;	/* session key */
+	uint8_t  u8key;		/* session key */
 	uint8_t  u8cmd;		/* command */
 	uint8_t  u8sub;		/* sub command */
-	uint32_t u32opt1;	/* option 1 */
-	uint32_t u32opt2;	/* option 2 */
-	uint16_t u16len;
-	uint16_t u16sum;
+	uint8_t  u8opt;		/* option */
+	uint32_t u32val;	/* value */
 } __attribute__ ((__packed__));
 
 struct aoe_packet {
