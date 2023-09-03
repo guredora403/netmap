@@ -70,7 +70,6 @@ struct server_stats {
 	int req;
 	int recv;
 	int dreq_limits;
-	int recv_limits;
 	int last_volume_value;
 	int client_mtu;
 	int server_mtu;
@@ -118,7 +117,7 @@ static void calc_stats(struct stats *t, unsigned long trip)
 #define incr(x)	do {x += 1;} while (0)
 #endif
 
-static void __attribute__ ((noinline)) teardown(char *msg)
+static void teardown(char *msg)
 {
 	if (g.nmd && g.nmd->fd > 0) {
 		/* final part: wait all the TX queues to be empty. */
@@ -384,7 +383,7 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 			break;
 		}
 	}
-	s.dreq_limits = s.recv_limits = req_limits;
+	s.dreq_limits = req_limits;
 }
 
 static void spec(void)
@@ -517,6 +516,30 @@ static void pcm_ready(void)
 		teardown("pcm_set_params failed");
 }
 
+static void send_dreq(struct ether_addr *src, struct ether_addr *dst, ssize_t space, unsigned int buffered_playback_us, bool retry)
+{
+	/* C_DREQ (Data Request)
+	 *	u8cmd	C_DREQ
+	 *	u8sub	Number of Request Chunks
+	 *	u8opt	cyclic seq no
+	 *	u32val	chunk_bytes (first request only)
+	 *  payload buffered playback us
+	 *			Calculate the playable time from the buffered slots and include it in the payload.
+	 */
+	s.recv = 0;
+	s.last_ts = s.cur_ts;
+	if (!retry) {
+		s.req = space < s.dreq_limits ? space:s.dreq_limits;
+		s.cyclic_seq_no++;
+	}
+	uint32_t _val = 0;
+	if (!s.pcm_started && s.cyclic_seq_no == 1)
+		_val = (uint32_t)s.chunk_bytes;
+
+	__atomic_store_n(&ext->unarrived_dreq_packets, s.req, __ATOMIC_RELEASE);
+	struct aoe_packet * _pkt = prepare_tx_packet(src, dst, C_DREQ, s.req, s.cyclic_seq_no, _val, sizeof(buffered_playback_us));
+	memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
+}
 static void send_model_report(struct ether_addr *src, struct ether_addr *dst)
 {
 	/* C_REPORT (Report)
@@ -638,19 +661,11 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 #ifdef SERVER_STATS
 			s.poll_count = 0;
 #endif
-			/* C_DREQ (Data Request)
-			 *	u8cmd	C_DREQ
-			 *	u8sub	Number of Request Chunks
-			 *	u8opt	cyclic seq no
-			 *	u32val	chunk_bytes (first request only)
-			 */
-			s.req = s.dreq_limits;
-			s.last_ts = s.cur_ts;
-			s.cyclic_seq_no = 1;
-			__atomic_store_n(&ext->unarrived_dreq_packets, s.req, __ATOMIC_RELEASE);
+			/* initial dreq */
+			s.cyclic_seq_no = 0;
 			unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
-			_pkt = prepare_tx_packet(src, dst, C_DREQ, s.req, s.cyclic_seq_no, (uint32_t)s.chunk_bytes, sizeof(buffered_playback_us));
-			memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
+			send_dreq(src, dst, ext->num_slots -1 , buffered_playback_us, false);
+
 			break;
 		case C_QUERY: { /* SERVER side */ }
 			// Ignore consecutive queries
@@ -724,11 +739,11 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				/* show server status (lsaoe) */
 				sprintf(report,
 					"  PCM PARAM  : %s %u %u chunk_bytes:%d period_us:%u\n"
-					"  AoE STATS  : dreq=%d recv=%d (dreq timeout:%lu retry:%lu total packets:%lu)\n"
+					"  AoE STATS  : dreq=%d (dreq timeout:%lu retry:%lu total packets:%lu)\n"
 					"  DMA STATS  : %s (cb_frames:%d)\n"
 					"  SOUND CARD : %s\n",
 					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels, s.chunk_bytes, s.pcm.period_us,
-					s.dreq_limits, s.recv_limits, s.dreq_timeout, s.dreq_retry, s.recv_total,
+					s.dreq_limits, s.dreq_timeout, s.dreq_retry, s.recv_total,
 					ext->stat == ACTIVE ? "ACTIVE":"INACTIVE", s.cb_frames,
 					g.model.name);
 				strcat(report, "\n");
@@ -741,7 +756,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 					"receive packets : %6lu (AoE %lu, Others %lu)\n"
 					"poll total      : %6lu\n"
 					"poll avg.  (ms) : %6lu (min %lu, max %lu, expected %u)\n"
-					"poll/chunk x1000: %6lu (aoe.recv=%d)\n"
+					"poll/chunk x1000: %6lu\n"
 					"dreq/chunk x1000: %6lu (aoe.dreq=%d)\n"
 					"trip/chunk (us) : %6lu\n"
 					"act /chunk (ns) : %6lu\n",
@@ -749,7 +764,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 					s.recv_total+s.forward_total, s.recv_total, s.forward_total,
 					s.poll_total,
 					_avg, s.poll_stats.min == ULONG_MAX ? 0:s.poll_stats.min, s.poll_stats.max, s.pcm.period_us*s.dreq_limits/1000,
-					s.recv_total ? 1000*s.poll_total/s.recv_total:0, s.recv_limits,
+					s.recv_total ? 1000*s.poll_total/s.recv_total:0,
 					s.recv_total ? 1000*s.req_count/s.recv_total:0, s.dreq_limits,
 					s.recv_total ? s.trip_us_total/s.recv_total:0,
 					s.recv_total ? s.act_ns_total/s.recv_total:0);
@@ -767,9 +782,6 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			break;
 		case C_CLOSE:
 			if (g.stat != CONNECTED || g.key != aoe->u8key)
-				break;
-
-			if (memcmp(dst, &eh->ether_shost, 6) != 0)
 				break;
 
 			P("recv *Close* %s->CLOSED", Connects[g.stat]);
@@ -937,28 +949,14 @@ int main(int arc, char **argv)
 			int _cur = __atomic_load_n(&ext->cur, __ATOMIC_ACQUIRE);
 			int avail = CIRC_CNT(ext->head, _tail, ext->num_slots);
 			int real_avail = CIRC_CNT(ext->head, _cur, ext->num_slots);
+			int space = ext->num_slots - avail -1;
 			g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
 
 			/* DREQ */
 			if (s.req == 0) {
-				int space = ext->num_slots - avail -1;
 				if (space > s.dreq_limits/2) {
-					/* C_DREQ (Data Request)
-					 *	u8cmd	C_DREQ
-					 *	u8sub	Number of Request Chunks
-					 *	u8opt	cyclic seq no
-					 *	u32val	0 (not use)
-					 */
-					s.req = space < s.dreq_limits ? space:s.dreq_limits;
-					s.last_ts = s.cur_ts;
-					s.cyclic_seq_no++;
-					__atomic_store_n(&ext->unarrived_dreq_packets,
-						s.req < s.recv_limits ? s.req:s.recv_limits, __ATOMIC_RELEASE);
-					/* Calculate the playable time from the buffered slots and include it in the payload. */
-					unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
-					struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cyclic_seq_no, 0, sizeof(buffered_playback_us));
-					memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
-
+					unsigned int buffered_playback_us = avail * s.pcm.period_us;
+					send_dreq(&src, &dst, space, buffered_playback_us, false);
 					/* Wake up before a buffer underrun occurs.
 					 * However, if there is already limited time remaining,
 					 * set a standard timeout with the expectation of an immediate response. */
@@ -978,10 +976,10 @@ int main(int arc, char **argv)
 				/* retry */
 				enum DMAStatus _stat = __atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE);
 
-				/* Usually, `real_avail` is maintained in a state close to full,
-				 * but if it falls below `cb_frames`,
-				 * it is considered either a packet loss or a playback stop. */
 				if (_stat == ACTIVE && 0 < real_avail && real_avail < s.cb_frames) {
+					/* Usually, `real_avail` is maintained in a state close to full,
+					 * but if it falls below `cb_frames`,
+					 * it is considered either a packet loss or a playback stop. */
 					struct timespec _ts;
 					clock_gettime(CLOCK_MONOTONIC, &_ts);
 					if (next_retry_ns < timespec_to_ns(_ts)) {
@@ -989,27 +987,28 @@ int main(int arc, char **argv)
 							avail, real_avail, s.req, s.recv, s.cyclic_seq_no);
 						s.dreq_retry++;
 
-						s.recv = 0;
-						__atomic_store_n(&ext->unarrived_dreq_packets, s.req, __ATOMIC_RELEASE);
-
-						/* Calculate the playable time from the buffered slots and include it in the payload. */
-						unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
-						struct aoe_packet * _pkt = prepare_tx_packet(&src, &dst, C_DREQ, s.req, s.cyclic_seq_no, 0, sizeof(buffered_playback_us));
-						memcpy(_pkt->body, &buffered_playback_us, sizeof(buffered_playback_us));
+						unsigned int buffered_playback_us = avail * s.pcm.period_us;
+						send_dreq(&src, &dst, space, real_avail, true);
 
 						/* Consider the timeout period to avoid repeating resend requests,
 						 * as no response can be obtained when playback is stopped.*/
 						g.poll_timeout_ms = MAX(DEFAULT_TIMEOUT_MS, buffered_playback_us/2000);
-
 						next_retry_ns = timespec_to_ns(_ts) + g.poll_timeout_ms * 1000 * 1000;
 					}
-				}
-
-				/* data request timeout */
-				if (_stat == INACTIVE && avail == 0 && s.pcm_started) {
+				} else if (_stat == INACTIVE && avail == 0 && s.pcm_started) {
+					/* data request timeout */
 					P("send *Close* There is no response to the data request, and DMA has stopped. (req:%d recv:%d)", s.req, s.recv);
 					send_close(&src, &dst);
 					s.dreq_timeout++;
+				} else if (_stat == INACTIVE && ! s.pcm_started) {
+					/* Is it necessary to retry the initial DREQ? */
+					unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
+					if (timespec_diff_ns(s.last_ts, s.cur_ts) > buffered_playback_us * 1000) {
+						P("retry initial dreq!? (req:%d recv:%d)", s.req, s.recv);
+
+						/* initial dreq */
+						send_dreq(&src, &dst, space , buffered_playback_us, true);
+					}
 				}
 			}
 		}
@@ -1061,13 +1060,9 @@ int main(int arc, char **argv)
 		}
 
 		switch (g.stat) {
-		case CLOSED:
-			reset();
-			break;
 		case TEARDOWN:
 			send_close(&src, &dst);
 			ioctl(g.nmd->fd, NIOCTXSYNC, NULL);
-			goto END;
 		case EXIT:
 			goto END;
 		default:

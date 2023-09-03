@@ -1,9 +1,9 @@
-//#include <limits.h>
 #include <signal.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <arpa/inet.h>			/* ntohs */
 #include <linux/if_packet.h>    /* sockaddr_ll */
 #include <netinet/ether.h>		/* ether_aton_r */
@@ -63,8 +63,6 @@ struct client_stats {
 	struct vsound_pcm pcm;
 	struct vsound_pcm session_pcm;
 	uint32_t last_mixer_value;
-	unsigned long readtimeout_count;
-	unsigned long eof_count;
 	unsigned long eintr_count;
 	struct timespec model_req_ts;
 };
@@ -77,19 +75,14 @@ static int read_stats(void)
 }
 static int read_buf(int fd, char *buf, int count, uint64_t timeout)
 {
+	/* vsound returns EAGAIN when there is no data. It never returns 0. */
+	/* If the return value is smaller than the request, it indicates underrun. */
 	int l = 0, r;
 	do {
 		r = read(fd, buf + l, count - l);
 		if (likely(r > 0)) {
 			l += r;
 			continue;
-		} else if (r == 0) {
-			c.eof_count++;
-			if (l > 0) {
-				/* drain */
-				memset(buf + l, 0x00, count - l);
-			}
-			return l;
 		} else {
 			if (errno == EINTR) {
 				c.eintr_count++;
@@ -102,13 +95,7 @@ static int read_buf(int fd, char *buf, int count, uint64_t timeout)
 					continue;
 				}
 			}
-			c.readtimeout_count++;
-			if (l > 0) {
-				/* drain */
-				memset(buf + l, 0x00, count - l);
-				return l;
-			}
-			return -ENODATA;
+			return l;
 		}
 	} while (l < count);
 
@@ -235,8 +222,8 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 	if (eh->ether_type == htons(ETHERTYPE_LE2)) {
 		switch (aoe->u8cmd) {
 		case C_DREQ: /* CLIENT side */
-			if (g.stat == CONNECTED) {
-				if (g.key != aoe->u8key)
+			if (likely(g.stat == CONNECTED)) {
+				if (unlikely(g.key != aoe->u8key))
 					break;
 #ifdef PACKET_LOSS_EMULATION
 				if (rand() % 1000 == 0) {
@@ -261,15 +248,21 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 					ETHER_ADDR_PTR((struct ether_addr *)&eh->ether_shost),
 					Connects[g.stat], c.chunk_bytes);
 
-				// update dst only
+				/* update dst only */
 				if (g.options & OPT_AUTO) {
 					memcpy(dst, &eh->ether_shost, ETH_ALEN);
 					memcpy(g.sll.sll_addr, dst, ETH_ALEN);
 				}
+
+				/* prepare all packet except for last_cyclic_seq_no */
+				for (int i = 0, last = aoe->u8sub; i < last; i++) {
+					prepare_tx_packet((struct aoe_packet *)pkt_array[i],
+						src, dst, g.key, C_DRES, i, 0, 0);
+				}
 			}
 
 			/* Check if it's a retry or not. */
-			if (c.last_cyclic_seq_no == aoe->u8opt) {
+			if (unlikely(c.last_cyclic_seq_no == aoe->u8opt)) {
 				P("recv retry request! (opt:%u)", aoe->u8opt);
 				goto RETRY_REQUEST;
 			}
@@ -289,13 +282,13 @@ static inline int unbox(struct aoe_packet * rx_pkt, struct ether_addr * src, str
 				 *	u8opt	cyclic seq no
 				 *	u32val	0 (not use)
 				 */
-				tx_pkt = prepare_tx_packet((struct aoe_packet *)pkt_array[i],
-					src, dst, g.key, C_DRES, i, c.last_cyclic_seq_no, 0);
+				tx_pkt = (struct aoe_packet *)pkt_array[i];
+				tx_pkt->aoe.u8opt = c.last_cyclic_seq_no;
 				ret = read_buf(g.read_fd, (void *)tx_pkt->body, c.chunk_bytes, limit_ns);
 
 				if (unlikely(ret < c.chunk_bytes)) {
-					P("recv *Data Request*, but no data (%d:%s), send *Close*",
-						errno, strerror(errno));
+					P("recv *Data Request*, but there are %dB left (%d:%s), send *Close*",
+						ret, errno, strerror(errno));
 					send_close(src, dst);
 					return 1;
 				}
@@ -312,7 +305,7 @@ RETRY_REQUEST:
 			}
 
 			/* dump first 16 Bytes */
-			if (g.stat != CONNECTED) {
+			if (unlikely(g.stat != CONNECTED)) {
 				g.stat = CONNECTED;
 				struct aoe_packet * pkt = (struct aoe_packet *)pkt_array[0];
 				uint8_t * s = (uint8_t *)pkt->body;
@@ -350,13 +343,13 @@ RETRY_REQUEST:
 						"\n"
 						"  AoE STATUS : %s\n"
 						"  AoE SESSION: %6u\n"
-						"  AoE VSOUND : %s(%d) (buffer:%ldB timeout:%lu eof:%lu intr:%lu)\n",
+						"  AoE VSOUND : %s(%d) (buffer:%ldB intr:%lu)\n",
 						c.pcm.comm,
 						ETHER_ADDR_PTR((struct ether_addr*)&eh->ether_shost),
 						Connects[aoe->u8opt],
 						aoe->u8key,
 						snd_pcm_state_name(c.pcm.state), c.pcm.state,
-						c.pcm.buffer_bytes, c.readtimeout_count, c.eof_count, c.eintr_count);
+						c.pcm.buffer_bytes, c.eintr_count);
 					write(_fd, _buf, strlen(_buf));
 				}
 				write(_fd, rx_payload, paylen);
@@ -386,6 +379,7 @@ RETRY_REQUEST:
 
 int main(int arc, char **argv)
 {
+	mlockall(MCL_CURRENT | MCL_FUTURE);
 #ifdef PACKET_LOSS_EMULATION
 	srand(time(NULL));
 #endif
@@ -596,10 +590,7 @@ int main(int arc, char **argv)
 		if (nfds == -1) {
 			if (errno != EINTR && g.stat != EXIT)
 				g.stat = TEARDOWN;
-		} else if (nfds == 0) {
-			// timeout
-			continue;
-		} else {
+		} else if (nfds > 0) {
 			// unbox
 			for (int i = 0; i < nfds; ++i) {
 				if (events[i].data.fd == g.sock_fd) {

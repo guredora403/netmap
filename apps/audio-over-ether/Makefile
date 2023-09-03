@@ -1,7 +1,7 @@
 #settings
 CC=clang
 LD=ld.lld
-VERSION = 1.0RC6
+VERSION = v0.14
 SRCDIR ?= ../..
 VSOUND_HEADER_DIR = $(SRCDIR)/../vsound
 BUILDDIR = $(SRCDIR)
@@ -36,6 +36,11 @@ LDFLAGS = -L./
 
 
 # coverage (LLVM)
+# build and run,
+# mv /default.profraw .
+# llvm-profdata merge -o output.prof ./default.profraw
+# llvm-cov show ./aoe -instr-profile=./output.prof > cov.log
+#
 #CFLAGS += -fprofile-instr-generate -fcoverage-mapping
 #LDFLAGS += -fprofile-instr-generate -fcoverage-mapping
 
