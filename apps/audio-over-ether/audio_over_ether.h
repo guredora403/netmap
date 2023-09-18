@@ -12,14 +12,14 @@
 #define ETHER_ADDR_PTR(addr) (addr)->ether_addr_octet[0], (addr)->ether_addr_octet[1], (addr)->ether_addr_octet[2], (addr)->ether_addr_octet[3], (addr)->ether_addr_octet[4], (addr)->ether_addr_octet[5]
 
 /* IOCTL */
-#define IOCTL_PCM_START	_IO('a', 0)
-#define IOCTL_PCM_STOP	_IO('a', 1)
+#define IOCTL_PCM_START	_IOW('a', 0, int)
 
 /* Netmap, AoE */
 #define NM_BUFSZ			2048
 #define NM_NUM_SLOTS		1024
-#define AOE_NUM_SLOTS		1024
-#define AOE_BUF_SIZE		(NM_BUFSZ*NM_NUM_SLOTS*2)
+#define AOE_NUM_SLOTS		2048
+#define UNIT_BUF_SIZE		(NM_BUFSZ*NM_NUM_SLOTS)
+#define AOE_BUF_SIZE		(NM_BUFSZ*NM_NUM_SLOTS*4 + sizeof(struct ext_slot))
 #define HW_RXRING_IDX0		2
 #define HOST_TXRING_IDX0	7170
 #define AOE_LUT_INDEX		100000

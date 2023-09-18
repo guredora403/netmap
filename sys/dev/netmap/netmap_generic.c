@@ -377,7 +377,7 @@ generic_netmap_register(struct netmap_adapter *na, int enable)
 	if (aoe_buf && ext_lut[0].vaddr == NULL) {
 		int i;
 		for (i=0; i < AOE_NUM_SLOTS; i++) {
-			ext_lut[i].vaddr = aoe_buf->area + AOE_BUF_SIZE + NM_BUFSZ * i;
+			ext_lut[i].vaddr = aoe_buf->area + UNIT_BUF_SIZE*2 + NM_BUFSZ * i;
 		}
 		nm_prinf("ext_lut[ 0].vaddr :0x%016llx (%p)", (unsigned long long)(ext_lut[0].vaddr), ext_lut[0].vaddr);
 		nm_prinf(" na_lut[ 0].vaddr :0x%016llx (%p)", (unsigned long long)(na->na_lut.lut[0].vaddr), na->na_lut.lut[0].vaddr);

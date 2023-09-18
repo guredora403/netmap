@@ -17,7 +17,7 @@
 #define MAX_ARGLEN		64
 #define CAP				64
 #define REMOTE_COMMAND	"/usr/local/bin/aoecmd.sh"
-
+#define INITIAL_DREQ_TIMEOUT_US	1000*1000*4
 static void usage(int errcode)
 {
 	const char *cmd = "aoebridge";
@@ -26,19 +26,20 @@ static void usage(int errcode)
 		"Usage:\n"
 		"  -h             Show program usage and exit.\n"
 		"  -i INTERFACE   (Optional)Network interface name. (Default eth0)\n"
-		"  -D DEVICE_NAME (Optional)select PCM by name. (Default hw:0,0)\n"
+//		"  -D DEVICE_NAME (Optional)select PCM by name. (Default hw:0,0)\n"
 		, cmd, AOE_VERSION);
 	exit(errcode);
 }
 
+enum OutputType {I2S, USB};
 static struct ext_slot *ext;
 struct globals {
 	enum Status stat;
 	uint8_t key;
+	enum OutputType type;
 	int poll_timeout_ms;
 	int options;
 #define OPT_AUTO	1
-//#define OPT_FORWARD	2
 	char *aoe_buf_addr;
 	struct nmport_d *nmd;
 	int aoe_buf_fd;
@@ -134,7 +135,7 @@ static void teardown(char *msg)
 
 	if (g.aoe_buf_addr) {
 		__atomic_store_n(&ext->unarrived_dreq_packets, 0, __ATOMIC_RELEASE);
-		munmap(g.aoe_buf_addr, AOE_BUF_SIZE * 2);
+		munmap(g.aoe_buf_addr, AOE_BUF_SIZE);
 		P("teardown ... aoe buffer unmaped.");
 	}
 	if (g.aoe_buf_fd) {
@@ -281,11 +282,10 @@ static void swapto(int is_hwring, struct netmap_slot * rxslot)
 #define NUM_FORMATS	3
 #define NUM_RATES	10
 #define SNDRV_PCM_FMTBIT(fmt)      (1ULL << (int)fmt)
-int avail_rate[NUM_RATES] =
-	{44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000};
+int avail_rate[NUM_RATES] = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000};
 unsigned int sndrv_pcm_rate[NUM_RATES] =
 	{(1U<<6), (1U<<7), (1U<<9), (1U<<10), (1U<<11), (1U<<12), (1U<<13), (1U<<14), (1U<<15), (1U<<16)};
-snd_pcm_format_t avail_format[NUM_FORMATS] = {SND_PCM_FORMAT_S16, SND_PCM_FORMAT_S24, SND_PCM_FORMAT_S32};
+//snd_pcm_format_t avail_format[NUM_FORMATS] = {SND_PCM_FORMAT_S16, SND_PCM_FORMAT_S24, SND_PCM_FORMAT_S32};
 
 static void pcm_rate_changed (snd_pcm_format_t format,
 		unsigned int rate, unsigned int channels, ssize_t buffer_bytes)
@@ -329,22 +329,22 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 		switch (rate) {
 		case 48000:
 		case 44100:
-			s.cb_frames = 32;
+			s.cb_frames = 16;
 			req_limits = (req_limits < 6) ? req_limits:6;
 			break;
 		case 96000:
 		case 88200:
-			s.cb_frames = 64;
+			s.cb_frames = 32;
 			req_limits = (req_limits < 12) ? req_limits:12;
 			break;
 		case 192000:
 		case 176400:
-			s.cb_frames = 128;
+			s.cb_frames = 64;
 			req_limits = (req_limits < 24) ? req_limits:24;
 			break;
 		case 384000:
 		case 352800:
-			s.cb_frames = 256;
+			s.cb_frames = 128;
 			req_limits = (req_limits < 48) ? req_limits:48;
 			break;
 		default:
@@ -358,17 +358,17 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 		switch (rate) {
 		case 48000:
 		case 44100:
-			s.cb_frames = 64;
+			s.cb_frames = 32;
 			req_limits = (req_limits < 12) ? req_limits:12;
 			break;
 		case 96000:
 		case 88200:
-			s.cb_frames = 128;
+			s.cb_frames = 64;
 			req_limits = (req_limits < 24) ? req_limits:24;
 			break;
 		case 192000:
 		case 176400:
-			s.cb_frames = 256;
+			s.cb_frames = 128;
 			req_limits = (req_limits < 48) ? req_limits:48;
 			break;
 		case 384000:
@@ -386,6 +386,39 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 	s.dreq_limits = req_limits;
 }
 
+void detectSoundModule(void) {
+    FILE *file = fopen("/proc/asound/modules", "r");
+    if (file == NULL) {
+        teardown("Failed to open /proc/asound/modules");
+    }
+
+    char line[256];
+    int moduleNumber = -1;
+
+    while (fgets(line, sizeof(line), file)) {
+        int currentModuleNumber;
+        char currentModuleName[256];
+
+        if (sscanf(line, "%d %s", &currentModuleNumber, currentModuleName) == 2) {
+            if (strcmp(currentModuleName, "snd_usb_audio") == 0) {
+                moduleNumber = currentModuleNumber;
+                break;
+            }
+        }
+    }
+
+    fclose(file);
+
+	if (moduleNumber > 0) {
+		sprintf(g.pcm_name, "hw:%d", moduleNumber);
+		g.type = USB;
+	} else {
+		strcpy(g.pcm_name, "hw:0");
+		g.type = I2S;
+	}
+    return;
+}
+
 static void spec(void)
 {
 	snd_pcm_format_t _format = SND_PCM_FORMAT_UNKNOWN;
@@ -393,9 +426,21 @@ static void spec(void)
 	unsigned int _channels = 0;
 	snd_pcm_hw_params_t *params;
 
-	int err = snd_pcm_open(&g.handle, g.pcm_name, SND_PCM_STREAM_PLAYBACK, OPENMODE);
-	if (err < 0) {
-		teardown("snd_pcm_open failed");
+	/* initialize */
+	g.model = (struct vsound_model){ 0 };
+
+	if (g.handle) {
+		snd_pcm_drain(g.handle);
+		snd_pcm_close(g.handle);
+	}
+	int retry_count = 10;
+	while(snd_pcm_open(&g.handle, g.pcm_name, SND_PCM_STREAM_PLAYBACK, OPENMODE) < 0) {
+		P("spec1 loop %d %d", retry_count, errno);
+		if (--retry_count == 0) {
+			P("%s", g.pcm_name);
+			teardown("snd_pcm_open failed (spec)");
+		}
+		usleep(50*1000);
 	}
 
 	/* name */
@@ -404,11 +449,13 @@ static void spec(void)
 	snd_pcm_info_set_device(pcminfo, 0);
 	snd_pcm_info_set_subdevice(pcminfo, 0);
 	snd_pcm_info_set_stream(pcminfo, SND_PCM_STREAM_PLAYBACK);
-	err = snd_pcm_info(g.handle, pcminfo);
+	int err = snd_pcm_info(g.handle, pcminfo);
 	if (err < 0) {
 		teardown("snd_pcm_info failed");
 	}
 	strcpy(g.model.name, snd_pcm_info_get_name(pcminfo));
+
+	P("[%s] %s", g.pcm_name, g.model.name);
 
 	/* hw_params */
 	snd_pcm_hw_params_alloca(&params);
@@ -416,14 +463,14 @@ static void spec(void)
 
 	int i;
 	P("Available formats:");
-	for (i = 0; i < NUM_FORMATS ; i++) {
-		if (snd_pcm_hw_params_test_format(g.handle, params, avail_format[i]) == 0) {
-			g.model.formats |= SNDRV_PCM_FMTBIT(avail_format[i]);
-			P("- %s", snd_pcm_format_name(avail_format[i]));
+	for (i = 0; i <= SND_PCM_FORMAT_LAST ; i++) {
+		if (snd_pcm_hw_params_test_format(g.handle, params, i) == 0) {
+			g.model.formats |= SNDRV_PCM_FMTBIT(i);
+			P("- %s", snd_pcm_format_name(i));
 			if (_format == SND_PCM_FORMAT_UNKNOWN)
-				_format = avail_format[i];
+				_format = i;
 		} else {
-			avail_format[i] = NOT_SUPPORT;
+//			avail_format[i] = NOT_SUPPORT;
 		}
 	}
 	P("Available rates:");
@@ -437,17 +484,25 @@ static void spec(void)
 				g.model.rate_min = avail_rate[i];
 			}
 		} else {
-			avail_rate[i] = NOT_SUPPORT;
+//			avail_rate[i] = NOT_SUPPORT;
 		}
 	}
 	if (snd_pcm_hw_params_test_channels(g.handle, params, 2) == 0) {
-		P("Stereo channel supported.");
+//		P("Stereo channel supported.");
 		_channels = 2;
 		g.model.channels_min = 2;
 		g.model.channels_max = 2;
 	} else {
 		teardown("Stereo channel not supported!");
 	}
+
+	/* buffer size check */
+	snd_pcm_uframes_t buffer_size_max;
+	snd_pcm_hw_params_get_buffer_size_max(params, &buffer_size_max);
+	if ((g.model.rate_max >= 352800 && buffer_size_max < 380928/4)
+		|| (g.model.rate_max >= 176400 && buffer_size_max < 190464/4))
+		P("The hardware buffer size is insufficient! buffer_size_max:%lu", buffer_size_max);
+//	P("buffer_size_max:%lu", buffer_size_max);
 
 	pcm_rate_changed(_format, _rate, _channels, 4096);
 }
@@ -550,6 +605,7 @@ static void send_model_report(struct ether_addr *src, struct ether_addr *dst)
 	 */
 	struct aoe_packet * _pkt = prepare_tx_packet(src, dst, C_REPORT, MODEL_SPEC, 0, 0, sizeof(struct vsound_model));
 	memcpy(_pkt->body, &g.model, sizeof(struct vsound_model));
+//	ioctl(g.nmd->fd, NIOCTXSYNC, NULL);
 }
 static void send_close(struct ether_addr *src, struct ether_addr *dst)
 {
@@ -639,7 +695,8 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 				|| s.pcm.buffer_bytes != _buffer_bytes) {
 
 				// When changing rates, wait until playback is complete.
-				while (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == ACTIVE)
+
+				while (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == ACTIVE || snd_pcm_state(g.handle) == SND_PCM_STATE_DRAINING)
 					usleep(1000 * 10);
 
 				__atomic_store_n(&ext->head, 0, __ATOMIC_RELEASE);
@@ -648,7 +705,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 
 				pcm_rate_changed(_format, _rate, _channels, _buffer_bytes);
 				pcm_ready();
-				ext->num_slots = s.cb_frames * 4;
+				ext->num_slots = s.cb_frames * 8;
 				P("pcminfo changed %s %u %u chunk_bytes:%d period_us:%u buffer:%ldB(%ldms)",
 					snd_pcm_format_name(s.pcm.format), s.pcm.rate, s.pcm.channels,
 					s.chunk_bytes, s.pcm.period_us, _buffer_bytes,
@@ -663,7 +720,8 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 #endif
 			/* initial dreq */
 			s.cyclic_seq_no = 0;
-			unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
+//			unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
+			unsigned int buffered_playback_us = INITIAL_DREQ_TIMEOUT_US;
 			send_dreq(src, dst, ext->num_slots -1 , buffered_playback_us, false);
 
 			break;
@@ -688,7 +746,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 			/* Model Spec Report */
 			if (aoe->u8sub == MODEL_SPEC) {
 				send_model_report(src, &query_host);
-				P("send *Report(%d)* model spec (%luB)", MODEL_SPEC, sizeof(struct vsound_model));
+				P("send *Report(%d)* model spec (%s)", MODEL_SPEC, g.model.name);
 				break;
 			} if (aoe->u8sub == SIGRTMIN) {
 #ifdef SERVER_STATS
@@ -817,7 +875,6 @@ int main(int arc, char **argv)
 	g.stat = CLOSED;
 	g.poll_timeout_ms = DEFAULT_TIMEOUT_MS;
 	strcpy(g.if_name, "eth0");
-	strcpy(g.pcm_name, "hw:0,0");
 
 	int ch;
 	while ((ch = getopt(arc, argv, "hvi:D:s")) != -1) {
@@ -834,13 +891,14 @@ int main(int arc, char **argv)
 			}
 			strcpy(g.if_name, optarg);
 			break;
-		case 'D':
+/*		case 'D':
 			if (strlen(optarg) > MAX_ARGLEN) {
 				D("device name too long %s", optarg);
 				break;
 			}
 			strcpy(g.pcm_name, optarg);
 			break;
+*/
 		}
 	}
 
@@ -850,21 +908,26 @@ int main(int arc, char **argv)
 	signal(SIGABRT, signal_handler);
 
 	/* initial pcm setup */
+	P("aoebridge %s", AOE_VERSION);
+
+	strcpy(g.pcm_name, "hw:0");
+	g.type = I2S;
 	spec();
 	pcm_ready();
 
 	/* open AoE buffer */
+	/* Make sure to open 'aoe_buf' with the I2S DMA buffer in an enabled state. */
 	g.aoe_buf_fd = open("/proc/aoe_buf", O_RDWR | O_SYNC);
 	if (g.aoe_buf_fd < 0) {
 		teardown("aoe_buf open failed");
 	}
-	g.aoe_buf_addr = mmap(NULL, AOE_BUF_SIZE*2, PROT_READ | PROT_WRITE, MAP_SHARED, g.aoe_buf_fd, 0);
+	g.aoe_buf_addr = mmap(NULL, AOE_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g.aoe_buf_fd, 0);
 	if (g.aoe_buf_addr == MAP_FAILED) {
 		teardown("aoe_buf mmap failed");
 	}
 	/* ext_slot */
-	ext = (struct ext_slot *)((void *)g.aoe_buf_addr + AOE_BUF_SIZE + NM_BUFSZ * AOE_NUM_SLOTS);
-	ext->num_slots = s.cb_frames * 4;
+	ext = (struct ext_slot *)((void *)g.aoe_buf_addr + UNIT_BUF_SIZE*4);
+	ext->num_slots = s.cb_frames * 8;
 	ext->tail = s.req = 0;
 	__atomic_store_n(&ext->head, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&ext->cur, 0, __ATOMIC_RELEASE);
@@ -881,8 +944,6 @@ int main(int arc, char **argv)
 	if (ioctl(sock_fd, SIOCGIFHWADDR, &ifr) == -1)
 		teardown("SIOCGIFHWADDR fail");
 	memcpy(&src, &ifr.ifr_hwaddr.sa_data, 6);
-	P("aoebridge %s [%s] HWaddr " ETHER_ADDR_FMT,
-		AOE_VERSION, g.if_name, ETHER_ADDR_PTR(&src));
 
 	/* MTU */
 	if (ioctl(sock_fd, SIOCGIFMTU, &ifr) == -1)
@@ -901,8 +962,18 @@ int main(int arc, char **argv)
 	connect(sock_fd,(struct sockaddr *)&dst_addr,sizeof(dst_addr));
 	getsockname(sock_fd, (struct sockaddr *)&src_addr, &addr_len);
 	inet_ntop(AF_INET, &src_addr.sin_addr, g.ip_addr, INET_ADDRSTRLEN);
-	P("ip addr: %s", g.ip_addr);
 	close(sock_fd);
+
+	/* switch USB-DAC if available */
+	/* The switch to USB-DAC should be done after opening 'aoe_buf'. */
+	detectSoundModule();
+	if (g.type == USB) {
+		spec();
+		pcm_ready();
+	}
+
+	P("[%s] inet addr: %s  HWaddr: "ETHER_ADDR_FMT "  MTU: %d",
+		g.if_name, g.ip_addr, ETHER_ADDR_PTR(&src), ifr.ifr_mtu);
 
 	/* nmport */
 	char netmapif[100];
@@ -930,6 +1001,7 @@ int main(int arc, char **argv)
 
 	/* Model Spec Report */
 	send_model_report(&src, &dst);
+	P("send *Report(%d)* model spec (%s)", MODEL_SPEC, g.model.name);
 
 	/* main loop */
 	unsigned int cur, n, i;
@@ -955,7 +1027,12 @@ int main(int arc, char **argv)
 			/* DREQ */
 			if (s.req == 0) {
 				if (space > s.dreq_limits/2) {
-					unsigned int buffered_playback_us = avail * s.pcm.period_us;
+					/* debug */
+					snd_pcm_state_t state = snd_pcm_state(g.handle);
+					if (state == SND_PCM_STATE_DRAINING)
+						P("dreq... now draining?!");
+//					unsigned int buffered_playback_us = avail * s.pcm.period_us;
+					unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
 					send_dreq(&src, &dst, space, buffered_playback_us, false);
 					/* Wake up before a buffer underrun occurs.
 					 * However, if there is already limited time remaining,
@@ -975,7 +1052,7 @@ int main(int arc, char **argv)
 			} else {
 				/* retry */
 				enum DMAStatus _stat = __atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE);
-
+//				snd_pcm_state_t state = snd_pcm_state(g.handle);
 				if (_stat == ACTIVE && 0 < real_avail && real_avail < s.cb_frames) {
 					/* Usually, `real_avail` is maintained in a state close to full,
 					 * but if it falls below `cb_frames`,
@@ -996,14 +1073,18 @@ int main(int arc, char **argv)
 						next_retry_ns = timespec_to_ns(_ts) + g.poll_timeout_ms * 1000 * 1000;
 					}
 				} else if (_stat == INACTIVE && avail == 0 && s.pcm_started) {
+//				} else if (_stat == INACTIVE && s.pcm_started &&
+//					(state == SND_PCM_STATE_XRUN || state ==SND_PCM_STATE_SETUP)) {
 					/* data request timeout */
 					P("send *Close* There is no response to the data request, and DMA has stopped. (req:%d recv:%d)", s.req, s.recv);
 					send_close(&src, &dst);
 					s.dreq_timeout++;
 				} else if (_stat == INACTIVE && ! s.pcm_started) {
 					/* Is it necessary to retry the initial DREQ? */
-					unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
-					if (timespec_diff_ns(s.last_ts, s.cur_ts) > buffered_playback_us * 1000) {
+//					unsigned int buffered_playback_us =  ext->num_slots * s.pcm.period_us;
+//					if (timespec_diff_ns(s.last_ts, s.cur_ts) > buffered_playback_us * 1000) {
+					unsigned int buffered_playback_us =  INITIAL_DREQ_TIMEOUT_US;
+					if (timespec_diff_ns(s.last_ts, s.cur_ts) > (long)INITIAL_DREQ_TIMEOUT_US * 1000) {
 						P("retry initial dreq!? (req:%d recv:%d)", s.req, s.recv);
 
 						/* initial dreq */
@@ -1011,22 +1092,23 @@ int main(int arc, char **argv)
 					}
 				}
 			}
-		}
-
-		/* If DMA is inactive, call snd_pcm_start using ioctl. */
-		if (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == INACTIVE) {
-			int _cur = __atomic_load_n(&ext->cur, __ATOMIC_ACQUIRE);
-			const int ext_playable = ext->head >= _cur ? (ext->head - _cur):(ext->num_slots + ext->head - _cur);
-			if (ext_playable >= ext->num_slots/2) {
-				if (ioctl(g.aoe_buf_fd, IOCTL_PCM_START)) {
-					P("ioctl error!");
-				} else {
-					P("ioctl success!(playable:%d)", ext_playable);
-					s.pcm_started = true;
+			/* If DMA is inactive, call snd_pcm_start using ioctl. */
+			snd_pcm_state_t state = snd_pcm_state(g.handle);
+			if (__atomic_load_n(&ext->stat, __ATOMIC_ACQUIRE) == INACTIVE &&
+				(state == SND_PCM_STATE_PREPARED || state == SND_PCM_STATE_XRUN || state ==SND_PCM_STATE_SETUP)) {
+				const int ext_playable = ext->head >= _cur ? (ext->head - _cur):(ext->num_slots + ext->head - _cur);
+				if (ext_playable >= ext->num_slots/2) {
+					if (ioctl(g.aoe_buf_fd, IOCTL_PCM_START, &g.type)) {
+						P("ioctl error!");
+					} else {
+						P("ioctl success!(playable:%d)", ext_playable);
+						s.pcm_started = true;
+					}
 				}
+			} else if (state == SND_PCM_STATE_DRAINING) {
+//				P("draining now!");
 			}
 		}
-
 #ifdef SERVER_STATS
 		/* act_ns_total */
 		if (g.stat == CONNECTED) {
@@ -1038,7 +1120,7 @@ int main(int arc, char **argv)
 #endif
 		int poll_ret = poll(pollfd, 1, g.poll_timeout_ms);
 		clock_gettime(CLOCK_MONOTONIC, &s.cur_ts);
-		if (g.stat != EXIT && g.stat != TEARDOWN && poll_ret == 0)
+		if (poll_ret == 0 && g.stat != EXIT && g.stat != TEARDOWN)
 			continue;
 
 		for (i = g.nmd->first_rx_ring; i <= g.nmd->last_rx_ring; i++) {
