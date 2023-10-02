@@ -71,6 +71,7 @@ struct server_stats {
 	int req;
 	int recv;
 	int dreq_limits;
+	int dreq_limits_max;
 	int last_volume_value;
 	int client_mtu;
 	int server_mtu;
@@ -318,7 +319,8 @@ static void pcm_rate_changed (snd_pcm_format_t format,
 	s.pcm.period_us = 1000000 * s.period_size / rate;
 
 	/* Consideration to ensure that DREQ does not exceed the buffer size of vsound. */
-	int req_limits = buffer_bytes / s.chunk_bytes;
+	int req_limits = (buffer_bytes/2) / s.chunk_bytes;
+	s.dreq_limits_max = MIN(buffer_bytes / s.chunk_bytes, 64);
 
 	/*
 	 * Note that ext->num_slots is four times cb_frames.
@@ -584,7 +586,8 @@ static void send_dreq(struct ether_addr *src, struct ether_addr *dst, ssize_t sp
 	s.recv = 0;
 	s.last_ts = s.cur_ts;
 	if (!retry) {
-		s.req = space < s.dreq_limits ? space:s.dreq_limits;
+//		s.req = space < s.dreq_limits ? space:s.dreq_limits;
+		s.req = space < s.dreq_limits_max ? space:s.dreq_limits_max;
 		s.cyclic_seq_no++;
 	}
 	uint32_t _val = 0;
@@ -826,7 +829,7 @@ static inline int unbox(void * buf, struct ether_addr * src, struct ether_addr *
 					s.recv_total ? 1000*s.req_count/s.recv_total:0, s.dreq_limits,
 					s.recv_total ? s.trip_us_total/s.recv_total:0,
 					s.recv_total ? s.act_ns_total/s.recv_total:0);
-				for (int i = 0; i < s.dreq_limits; i++) {
+				for (int i = 0; i < s.dreq_limits_max; i++) {
 					char _buf[50];
 					long tavg = s.trip_stats[i].count > 0 ? (long)((long)(s.trip_stats[i].ttl)/s.trip_stats[i].count)/100:0;
 					sprintf(_buf, "%2d:%5lu %2ld.%1ld\n", i+1, s.trip_stats[i].count, tavg/10, tavg%10);
@@ -1064,8 +1067,8 @@ int main(int arc, char **argv)
 							avail, real_avail, s.req, s.recv, s.cyclic_seq_no);
 						s.dreq_retry++;
 
-						unsigned int buffered_playback_us = avail * s.pcm.period_us;
-						send_dreq(&src, &dst, space, real_avail, true);
+						unsigned int buffered_playback_us = real_avail * s.pcm.period_us;
+						send_dreq(&src, &dst, space, buffered_playback_us, true);
 
 						/* Consider the timeout period to avoid repeating resend requests,
 						 * as no response can be obtained when playback is stopped.*/

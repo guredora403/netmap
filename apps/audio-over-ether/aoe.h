@@ -13,6 +13,7 @@
 
 /* util */
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) > (b) ? (b) : (a))
 
 /* AoE Status */
 enum Status	{CONNECTED, CLOSED, TEARDOWN, EXIT};

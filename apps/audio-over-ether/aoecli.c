@@ -297,7 +297,7 @@ RETRY_REQUEST:
 			for (int i = 0, last = aoe->u8sub; i < last; i++) {
 #ifdef PACKET_LOSS_EMULATION
 				if (rand() % 1000 == 999 && rand() % last == i) {
-					P("packet loss emulation *recv loss* (opt:%u)", cyclic_seq_no);
+					P("packet loss emulation *recv loss* (opt:%u)", c.last_cyclic_seq_no);
 					continue;
 				}
 #endif
