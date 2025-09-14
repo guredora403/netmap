@@ -558,7 +558,7 @@ int main(int arc, char **argv)
 
 						c.last_ts = c.cur_ts;
 						g.poll_timeout_ms = BROADCAST_MS;
-						P("send *Neighbor Discovery* (%s) %s %u %u (buffer:%ldB avail:%ldB)",
+						P("send *Neighbor Discovery* (%s) %s %u %u (buffer:%zdB avail:%zdB)",
 							snd_pcm_state_name(c.pcm.state), snd_pcm_format_name(c.pcm.format), c.pcm.rate, c.pcm.channels,
 							c.pcm.buffer_bytes, avail_bytes);
 					}
