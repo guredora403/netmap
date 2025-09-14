@@ -20,7 +20,7 @@ WARN_FLAGS += -Wshadow
 
 CFLAGS  = -DAOE_VERSION=\"$(VERSION)\"
 CFLAGS += -O3 -pipe -g
-CFLAGS += -mcpu=cortex-a72 -march=armv8-a+crc -mtune=cortex-a72
+CFLAGS += -march=armv7-a
 CFLAGS += -fno-stack-protector
 CFLAGS += -fno-semantic-interposition
 CFLAGS += -fno-math-errno

@@ -316,7 +316,7 @@ RETRY_REQUEST:
 
 			break;
 		case C_REPORT:	/* CLIENT side */
-			P("recv *Report(%u)* (%ldB) ", aoe->u8sub, paylen);
+			P("recv *Report(%u)* (%zdB) ", aoe->u8sub, paylen);
 
 			/* recieve Model Spec Report */
 			if (aoe->u8sub == MODEL_SPEC) {
@@ -343,7 +343,7 @@ RETRY_REQUEST:
 						"\n"
 						"  AoE STATUS : %s\n"
 						"  AoE SESSION: %6u\n"
-						"  AoE VSOUND : %s(%d) (buffer:%ldB intr:%lu)\n",
+						"  AoE VSOUND : %s(%d) (buffer:%zdB intr:%lu)\n",
 						c.pcm.comm,
 						ETHER_ADDR_PTR((struct ether_addr*)&eh->ether_shost),
 						Connects[aoe->u8opt],
@@ -530,7 +530,7 @@ int main(int arc, char **argv)
 					 /* 0.2 seconds' worth of buffer for the start_threshold. */
 					start_threshold = (c.pcm.rate/5) * c.pcm.channels * snd_pcm_format_physical_width(c.pcm.format)/8;
 					start_threshold = c.pcm.buffer_bytes/2 < start_threshold ? c.pcm.buffer_bytes/2 : start_threshold;
-					P("%s local_start_threshold:%ld avail_bytes:%ld", c.pcm.comm, start_threshold, avail_bytes);
+					P("%s local_start_threshold:%zd avail_bytes:%zd", c.pcm.comm, start_threshold, avail_bytes);
 					if (avail_bytes < start_threshold)
 						break;
 
